@@ -15,9 +15,9 @@ FEATURE_COLS = [
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
     'is_dba_pattern', 'source_origin',
-    'dense_cosine_sim', 'candidate_rank'
+    'candidate_rank'
 ]
-assert len(FEATURE_COLS) == 17, f"Expected 17 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
 
 COL_DTYPES = {
     'name_ratio': np.float32,
@@ -35,7 +35,6 @@ COL_DTYPES = {
     'country_match': np.float32,
     'is_dba_pattern': np.float32,
     'source_origin': np.float32,
-    'dense_cosine_sim': np.float32,
     'candidate_rank': np.float32,
     'source1_entity_id': 'str',
     'candidate_entity_id': 'str',
@@ -367,9 +366,20 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
 
 
 if __name__ == "__main__":
-    out_dir = r"C:\Users\anshu\OneDrive\Desktop\amazon-ml\output"
-    train_csv = os.path.join(out_dir, "full_train_features_v3.csv")
-    val_csv = os.path.join(out_dir, "full_val_features_v3.csv")
-    val_gt = os.path.join(out_dir, "val_gt_split.tsv")
+    import argparse
+    parser = argparse.ArgumentParser(description="Train LightGBM Model (16 features)")
+    parser.add_argument("--out-dir", default=None, help="Output directory for model and config")
+    parser.add_argument("--train-csv", default=None, help="Path to full_train_features_v3.csv")
+    parser.add_argument("--val-csv", default=None, help="Path to full_val_features_v3.csv")
+    parser.add_argument("--val-gt", default=None, help="Path to val_gt_split.tsv")
+    args = parser.parse_args()
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    out_dir = args.out_dir or os.path.join(repo_root, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    train_csv = args.train_csv or os.path.join(out_dir, "full_train_features_v3.csv")
+    val_csv = args.val_csv or os.path.join(out_dir, "full_val_features_v3.csv")
+    val_gt = args.val_gt or os.path.join(out_dir, "val_gt_split.tsv")
     
     train_and_evaluate(train_csv, val_csv, val_gt, out_dir)

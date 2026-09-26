@@ -220,7 +220,9 @@ def search_top_candidates(val_s1_path, cache_dir, output_path, model, k=30, min_
     print(f"Successfully generated candidate pairs! Saved to: {output_path}")
 
 
-def create_blocking(val_s1_path, s2_path, s3_path, output_path, cache_dir, model_name="intfloat/multilingual-e5-small", k=30):
+def create_blocking(val_s1_path, s2_path, s3_path, output_path, cache_dir, model_name="intfloat/multilingual-e5-small", k=30, require_cuda=True):
+    if require_cuda and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available! Dense semantic blocking requires a GPU (CUDA) to execute. Do not run on CPU.")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
@@ -242,25 +244,42 @@ def create_blocking(val_s1_path, s2_path, s3_path, output_path, cache_dir, model
 
 
 if __name__ == "__main__":
-    data_dir = r"C:\Users\anshu\OneDrive\Desktop\amazon-ml\6ab10eb3b23ba_student_resource\student_resource\dataset"
+    import argparse
+    parser = argparse.ArgumentParser(description="Dense Semantic Blocking")
+    parser.add_argument("--s1", default=None, help="Path to S1 TSV")
+    parser.add_argument("--s2", default=None, help="Path to S2 TSV")
+    parser.add_argument("--s3", default=None, help="Path to S3 TSV")
+    parser.add_argument("--output", default=None, help="Output candidate pairs TSV path")
+    parser.add_argument("--cache-dir", default=None, help="Embeddings cache directory")
+    parser.add_argument("--k", type=int, default=100, help="Top-K candidates per query")
+    parser.add_argument("--model-name", default="intfloat/multilingual-e5-small", help="SentenceTransformer model name")
+    parser.add_argument("--allow-cpu", action="store_true", help="Allow running on CPU (not recommended)")
+    args = parser.parse_args()
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    out_dir = os.path.join(repo_root, "output")
+    cache_dir = args.cache_dir or os.path.join(out_dir, "embeddings_cache")
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    cand_dirs = [
+        os.path.join(repo_root, "dataset", "train"),
+        os.path.join(repo_root, "student_resource", "dataset", "train"),
+    ]
+    train_dir = next((d for d in cand_dirs if os.path.exists(d)), cand_dirs[0])
     
-    s2_path = os.path.join(data_dir, "train", "train_source2.tsv")
-    s3_path = os.path.join(data_dir, "train", "train_source3.tsv")
-    
-    s1_path = os.path.join(data_dir, "train", "train_source1.tsv")
-    
-    output_dir = r"C:\Users\anshu\OneDrive\Desktop\amazon-ml\output"
-    cache_dir = os.path.join(output_dir, "embeddings_cache")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    out_path = os.path.join(output_dir, "full_train_candidate_pairs.tsv")
-    
+    s1_path = args.s1 or os.path.join(train_dir, "train_source1.tsv")
+    s2_path = args.s2 or os.path.join(train_dir, "train_source2.tsv")
+    s3_path = args.s3 or os.path.join(train_dir, "train_source3.tsv")
+    out_path = args.output or os.path.join(out_dir, "full_train_candidate_pairs.tsv")
+
     create_blocking(
         val_s1_path=s1_path, 
         s2_path=s2_path, 
         s3_path=s3_path, 
         output_path=out_path, 
         cache_dir=cache_dir,
-        model_name="intfloat/multilingual-e5-small", 
-        k=100
+        model_name=args.model_name, 
+        k=args.k,
+        require_cuda=not args.allow_cpu
     )

@@ -21,9 +21,9 @@ FEATURE_COLS = [
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
     'is_dba_pattern', 'source_origin',
-    'dense_cosine_sim', 'candidate_rank'
+    'candidate_rank'
 ]
-assert len(FEATURE_COLS) == 17, f"Expected 17 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
 
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
@@ -172,24 +172,121 @@ def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
     else:
         digits_match = 0.0
         
+    # 13. country_match
     country_match = 1.0 if (s1_country and c_country and s1_country == c_country) else 0.0
+    
+    # 14. is_dba_pattern
     is_dba_pattern = 1.0 if (street_name_sim >= 0.85 and street_num_match == 1.0 and country_match == 1.0) else 0.0
+    
+    # 15. source_origin
     source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
     
-    dense_sim = float(dense_score)
+    # 16. candidate_rank (raw integer rank 1..30 as float32)
     rank_val = float(rank_idx)
     assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
     
     res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
            is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-           country_match, is_dba_pattern, source_origin, dense_sim, rank_val)
-    assert len(res) == 17, f"Expected 17 features, got {len(res)}"
+           country_match, is_dba_pattern, source_origin, rank_val)
+    assert len(res) == 16, f"Expected 16 features, got {len(res)}"
     return res
+
+
+def fast_16_features(s1_rec, c_rec, cand_id, rank_idx=1):
+    """Computes the 16-feature vector (15 baseline + candidate_rank)."""
+    return fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)
 
 
 def fast_15_features(s1_rec, c_rec, cand_id):
     """Backwards-compatible wrapper returning the first 15 features."""
-    return fast_17_features(s1_rec, c_rec, cand_id, 0.0, 1)[:15]
+    return fast_16_features(s1_rec, c_rec, cand_id, 1)[:15]
+
+
+def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
+    """Full feature extraction function supporting 16 or 17 features."""
+    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
+    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
+    
+    # 1-4. Name similarities
+    if s1_name and c_name:
+        name_ratio = fuzz.ratio(s1_name, c_name) / 100.0
+        name_token_sort = fuzz.token_sort_ratio(s1_name, c_name) / 100.0
+        name_token_set = fuzz.token_set_ratio(s1_name, c_name) / 100.0
+        name_partial = fuzz.partial_ratio(s1_name, c_name) / 100.0
+    else:
+        name_ratio = name_token_sort = name_token_set = name_partial = 0.0
+        
+    # 5. Compact signature match
+    if s1_comp and c_comp and (s1_comp == c_comp or (len(s1_comp)>=6 and s1_comp in c_comp) or (len(c_comp)>=6 and c_comp in s1_comp)):
+        name_compact_match = 1.0
+    else:
+        name_compact_match = 0.0
+        
+    # 6. Acronym match
+    if (s1_acro and s1_acro == c_comp) or (c_acro and c_acro == s1_comp):
+        name_acronym_match = 1.0
+    else:
+        name_acronym_match = 0.0
+        
+    # 7. is_addr_missing
+    is_addr_missing = 1.0 if (not s1_addr or not c_addr) else 0.0
+    
+    # 8. street_num_match
+    if s1_num and c_num:
+        street_num_match = 1.0 if s1_num == c_num else 0.0
+    elif not s1_num and not c_num:
+        street_num_match = 0.5
+    else:
+        street_num_match = 0.5
+        
+    # 9. street_name_sim
+    if s1_street and c_street:
+        street_name_sim = fuzz.ratio(s1_street, c_street) / 100.0
+    elif not s1_street and not c_street:
+        street_name_sim = 0.5
+    else:
+        street_name_sim = 0.0
+        
+    # 10. city_state_sim
+    if s1_cs and c_cs:
+        city_state_sim = fuzz.token_set_ratio(s1_cs, c_cs) / 100.0
+    elif not s1_cs and not c_cs:
+        city_state_sim = 0.5
+    else:
+        city_state_sim = 0.0
+        
+    # 11. addr_token_sort
+    if s1_addr and c_addr:
+        addr_token_sort = fuzz.token_sort_ratio(s1_addr, c_addr) / 100.0
+    else:
+        addr_token_sort = 0.0
+        
+    # 12. digits_match
+    if s1_d and c_d:
+        digits_match = 1.0 if s1_d == c_d else 0.0
+    elif not s1_d and not c_d:
+        digits_match = 1.0
+    else:
+        digits_match = 0.0
+        
+    # 13. country_match
+    country_match = 1.0 if (s1_country and c_country and s1_country == c_country) else 0.0
+    
+    # 14. is_dba_pattern
+    is_dba_pattern = 1.0 if (street_name_sim >= 0.85 and street_num_match == 1.0 and country_match == 1.0) else 0.0
+    
+    # 15. source_origin
+    source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
+    
+    # 16. candidate_rank (raw integer rank 1..30 as float32)
+    rank_val = float(rank_idx)
+    assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
+    
+    res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
+           is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
+           country_match, is_dba_pattern, source_origin, rank_val)
+    assert len(res) == 16, f"Expected 16 features, got {len(res)}"
+    return res
 
 
 _WORKER_CONN = None
@@ -232,7 +329,7 @@ def process_inference_chunk(args):
     """
     Worker process:
     1. Fetches candidate and query metadata from SQLite and pre-normalizes once.
-    2. Computes the 15 features.
+    2. Computes the 16 features (15 baseline + candidate_rank).
     3. Runs inference via LightGBM, XGBoost, or Ensemble Blend.
     4. Evaluates matches with calibrated threshold and singleton guard.
     5. Formats output TSV lines in strictly preserved query order.
@@ -248,22 +345,16 @@ def process_inference_chunk(args):
         pairs_list = []
         
         for record in chunk_records:
-            if len(record) == 2:
-                s1_id, cands_str = record
-                scores = None
-            else:
-                s1_id, cands_str, scores = record[:3]
+            s1_id = record[0]
+            cands_str = record[1]
                 
             if not cands_str or cands_str == 'nan':
                 continue
             cands = [c.strip() for c in cands_str.split(',') if c.strip()]
-            if scores is not None:
-                assert len(scores) == len(cands), f"Number of dense scores ({len(scores)}) != number of candidates ({len(cands)}) for {s1_id}"
             for rank_idx, cid in enumerate(cands, start=1):
                 assert 1 <= rank_idx <= 30, f"Candidate rank {rank_idx} is out of expected [1, 30] range"
-                d_score = float(scores[rank_idx - 1]) if scores is not None else 0.0
                 needed_cand_ids.add(cid)
-                pairs_list.append((s1_id, cid, d_score, rank_idx))
+                pairs_list.append((s1_id, cid, rank_idx))
                 
         conn = get_worker_conn(db_path)
         cur = conn.cursor()
@@ -295,19 +386,19 @@ def process_inference_chunk(args):
                 catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
             del cat_rows
         
-        # 3. Compute 17 features
+        # 3. Compute 16 features
         num_pairs = len(pairs_list)
         empty_rec = ("", "", "", "", "", "", "", "", "")
         
         if num_pairs > 0:
-            X_feats = np.empty((num_pairs, 17), dtype=np.float32)
+            X_feats = np.empty((num_pairs, 16), dtype=np.float32)
             
-            for i, (s1_id, cand_id, d_score, r_idx) in enumerate(pairs_list):
+            for i, (s1_id, cand_id, r_idx) in enumerate(pairs_list):
                 s1_rec = s1_dict.get(s1_id, empty_rec)
                 c_rec = catalog_dict.get(cand_id, empty_rec)
-                f = fast_17_features(s1_rec, c_rec, cand_id, dense_score=d_score, rank_idx=r_idx)
-                assert len(f) == 17, f"Feature vector length must be 17, got {len(f)}"
-                for j in range(17):
+                f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+                assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
+                for j in range(16):
                     X_feats[i, j] = f[j]
                     
             # 4. Predict probabilities with chosen model architecture
@@ -332,7 +423,7 @@ def process_inference_chunk(args):
                 
             # 5. Group candidate probabilities by s1_id
             preds_by_s1 = {}
-            for (s1_id, cand_id, _, _), p in zip(pairs_list, probs):
+            for (s1_id, cand_id, _), p in zip(pairs_list, probs):
                 if s1_id not in preds_by_s1:
                     preds_by_s1[s1_id] = []
                 preds_by_s1[s1_id].append((cand_id, p))
@@ -537,19 +628,34 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
 
 
 if __name__ == "__main__":
+    import argparse
     import multiprocessing as mp
     mp.freeze_support()
     
-    base_dir = r"C:\Users\anshu\OneDrive\Desktop\amazon-ml"
-    test_dir = os.path.join(base_dir, "6ab10eb3b23ba_student_resource", "student_resource", "dataset", "test")
-    out_dir = os.path.join(base_dir, "output")
+    parser = argparse.ArgumentParser(description="Test Inference (16 features)")
+    parser.add_argument("--cands", default=None, help="Path to test candidate_pairs.tsv")
+    parser.add_argument("--s1", default=None, help="Path to test_source1.tsv")
+    parser.add_argument("--s2", default=None, help="Path to test_source2.tsv")
+    parser.add_argument("--s3", default=None, help="Path to test_source3.tsv")
+    parser.add_argument("--out-dir", default=None, help="Output directory containing models and config")
+    parser.add_argument("--out-matching", default=None, help="Output path for matching_results.tsv")
+    args = parser.parse_args()
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    out_dir = args.out_dir or os.path.join(repo_root, "output")
+    os.makedirs(out_dir, exist_ok=True)
     
-    s1_path = os.path.join(test_dir, "test_source1.tsv")
-    s2_path = os.path.join(test_dir, "test_source2.tsv")
-    s3_path = os.path.join(test_dir, "test_source3.tsv")
+    cand_dirs = [
+        os.path.join(repo_root, "dataset", "test"),
+        os.path.join(repo_root, "student_resource", "dataset", "test"),
+    ]
+    test_dir = next((d for d in cand_dirs if os.path.exists(d)), cand_dirs[0])
     
-    cands_path = os.path.join(out_dir, "candidate_pairs.tsv")
-    out_matching_path = os.path.join(out_dir, "matching_results.tsv")
+    s1_path = args.s1 or os.path.join(test_dir, "test_source1.tsv")
+    s2_path = args.s2 or os.path.join(test_dir, "test_source2.tsv")
+    s3_path = args.s3 or os.path.join(test_dir, "test_source3.tsv")
+    cands_path = args.cands or os.path.join(out_dir, "candidate_pairs.tsv")
+    out_matching_path = args.out_matching or os.path.join(out_dir, "matching_results.tsv")
     
     run_test_inference(
         cands_path, s1_path, s2_path, s3_path, 
