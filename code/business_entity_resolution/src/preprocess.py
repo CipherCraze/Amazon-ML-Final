@@ -1,7 +1,11 @@
 import pandas as pd
 import re
 import unicodedata
-import unidecode
+
+try:
+    import unidecode
+except ImportError:
+    unidecode = None
 
 # Precompile regexes for massive speedup
 
@@ -91,7 +95,8 @@ def normalize_text(text):
     
     # 2. Transliterate Indic scripts if present
     if indic_re.search(text):
-        text = unidecode.unidecode(text)
+        if unidecode is not None:
+            text = unidecode.unidecode(text)
         for pat, repl in indic_phonetic:
             text = pat.sub(repl, text)
             
