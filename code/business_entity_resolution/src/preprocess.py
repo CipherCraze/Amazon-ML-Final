@@ -20,6 +20,8 @@ indic_re = re.compile(r'[\u0900-\u0D7F]')
 indic_phonetic = [
     (re.compile(r'\bpra+[iy]?[vw]?[a-z]*[td]+\b', re.I), 'private'),
     (re.compile(r'\blimitt?e?dd?\b', re.I), 'limited'),
+    (re.compile(r'\bska+[iy]+\b', re.I), 'sky'),
+    (re.compile(r'\baind\b', re.I), 'and'),
     (re.compile(r'\b(?:elelpii|ellpii)\b', re.I), 'llp'),
     (re.compile(r'\bi[Nn]ttrne?shnl\b', re.I), 'international'),
     (re.compile(r'\binphraasttr[a-z]*\b', re.I), 'infrastructure'),
@@ -125,6 +127,37 @@ def normalize_text(text):
     text = punct_re.sub(' ', text)
     text = spaces_re.sub(' ', text).strip()
     return text
+
+
+def collapse_transliterated_vowels(text):
+    """
+    Conservatively collapses repeated vowel artifacts introduced specifically by
+    transliteration (e.g. 'skaaii' -> 'skai' / 'sky', 'aa' -> 'a', 'ii' -> 'i')
+    while preserving common English words.
+    """
+    if not text:
+        return ""
+    t = re.sub(r'\b([a-z]+)aa([a-z]+)\b', r'\1a\2', text) # internal aa -> a
+    t = re.sub(r'\b([a-z]+)ii([a-z]+)\b', r'\1i\2', t) # internal ii -> i
+    t = re.sub(r'\b([a-z]+)uu([a-z]+)\b', r'\1u\2', t) # internal uu -> u
+    t = re.sub(r'([a-z])\1{2,}', r'\1', t) # 3+ repeated characters -> single
+    return t
+
+
+def normalize_text_phonetic(text):
+    """
+    Conservative secondary phonetic normalization that generates a phonetic variant
+    specifically when Indic script is detected, collapsing transliteration artifacts.
+    Preserves original text if no Indic script is present.
+    """
+    if pd.isna(text) or not text:
+        return ""
+    has_indic = bool(indic_re.search(str(text)))
+    norm = normalize_text(text)
+    if has_indic:
+        norm = re.sub(r'\bska+[iy]+\b', 'sky', norm, flags=re.I)
+        norm = collapse_transliterated_vowels(norm)
+    return norm
 
 def get_compact_signature(name):
     """
