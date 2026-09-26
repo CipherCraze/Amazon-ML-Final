@@ -12,6 +12,15 @@ from rapidfuzz import fuzz
 
 from preprocess import normalize_text, get_compact_signature, get_acronym, decompose_address
 
+FEATURE_COLS = [
+    'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
+    'name_compact_match', 'name_acronym_match', 'is_addr_missing',
+    'street_num_match', 'street_name_sim', 'city_state_sim',
+    'addr_token_sort', 'digits_match', 'country_match',
+    'is_dba_pattern', 'source_origin',
+    'dense_cosine_sim', 'candidate_rank'
+]
+
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
     if not text:
@@ -63,7 +72,7 @@ def fetch_gt_by_ids(cur, id_list, batch_size=900):
     return gt_map
 
 
-def fast_15_features(s1_rec, c_rec, cand_id):
+def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
     s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
     c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
     
@@ -138,9 +147,21 @@ def fast_15_features(s1_rec, c_rec, cand_id):
     # 15. source_origin
     source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
     
+    # 16. dense_cosine_sim
+    dense_sim = float(dense_score)
+    
+    # 17. candidate_rank (raw integer rank 1..30 as float32)
+    rank_val = float(rank_idx)
+    assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
+    
     return (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
             is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-            country_match, is_dba_pattern, source_origin)
+            country_match, is_dba_pattern, source_origin, dense_sim, rank_val)
+
+
+def fast_15_features(s1_rec, c_rec, cand_id):
+    """Backwards-compatible wrapper returning the first 15 features."""
+    return fast_17_features(s1_rec, c_rec, cand_id, 0.0, 1)[:15]
 
 
 def process_chunk(args):
@@ -150,7 +171,7 @@ def process_chunk(args):
     2. Selects candidate pairs (Train: up to 8 negatives/pos; Val: top 30 undownsampled).
     3. Fetches candidate and query attributes using pure in-memory batched SELECT IN (?, ...).
     4. Pre-normalizes names and addresses once.
-    5. Computes the 15 features and formats directly as CSV strings.
+    5. Computes the 17 features and formats directly as CSV strings.
     """
     chunk_records, db_path = args
     
@@ -167,27 +188,39 @@ def process_chunk(args):
     pairs_val = []
     needed_cand_ids = set()
     
-    for s1_id, cands_str, is_val in chunk_records:
+    for rec in chunk_records:
+        if len(rec) == 3:
+            s1_id, cands_str, is_val = rec
+            scores_list = None
+        else:
+            s1_id, cands_str, is_val, scores_list = rec[:4]
+            
         if not cands_str or cands_str == 'nan':
             continue
         true_matches = gt_map.get(s1_id, set())
         raw_cands = [c.strip() for c in cands_str.split(',') if c.strip()]
+        if scores_list is not None:
+            assert len(scores_list) == len(raw_cands), f"Dense scores count ({len(scores_list)}) != candidates count ({len(raw_cands)}) for {s1_id}"
         
         if is_val:
-            for cid in raw_cands[:30]:
+            for rank_idx, cid in enumerate(raw_cands[:30], start=1):
+                assert 1 <= rank_idx <= 30, f"Candidate rank {rank_idx} is out of expected [1, 30] range"
+                d_score = float(scores_list[rank_idx - 1]) if scores_list is not None else 0.0
                 is_match = 1 if cid in true_matches else 0
-                pairs_val.append((s1_id, cid, is_match))
+                pairs_val.append((s1_id, cid, is_match, d_score, rank_idx))
                 needed_cand_ids.add(cid)
         else:
             neg_count = 0
             max_negs = max(8, len(true_matches) * 6)
-            for cid in raw_cands:
+            for rank_idx, cid in enumerate(raw_cands, start=1):
+                assert 1 <= rank_idx <= 30, f"Candidate rank {rank_idx} is out of expected [1, 30] range"
+                d_score = float(scores_list[rank_idx - 1]) if scores_list is not None else 0.0
                 is_match = 1 if cid in true_matches else 0
                 if is_match == 1:
-                    pairs_train.append((s1_id, cid, 1))
+                    pairs_train.append((s1_id, cid, 1, d_score, rank_idx))
                     needed_cand_ids.add(cid)
                 elif neg_count < max_negs:
-                    pairs_train.append((s1_id, cid, 0))
+                    pairs_train.append((s1_id, cid, 0, d_score, rank_idx))
                     needed_cand_ids.add(cid)
                     neg_count += 1
                     
@@ -224,25 +257,27 @@ def process_chunk(args):
     val_lines = []
     train_pos = train_neg = val_pos = val_neg = 0
     
-    for s1_id, cand_id, label in pairs_train:
+    for s1_id, cand_id, label, d_score, r_idx in pairs_train:
         s1_rec = s1_dict.get(s1_id, empty_rec)
         c_rec = catalog_dict.get(cand_id, empty_rec)
-        f = fast_15_features(s1_rec, c_rec, cand_id)
+        f = fast_17_features(s1_rec, c_rec, cand_id, dense_score=d_score, rank_idx=r_idx)
+        assert len(f) == 17, f"Feature vector length must be 17, got {len(f)}"
         train_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
                            f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
-                           f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{s1_id},{cand_id},{label}\n")
+                           f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.4f},{f[16]:.1f},{s1_id},{cand_id},{label}\n")
         if label == 1:
             train_pos += 1
         else:
             train_neg += 1
             
-    for s1_id, cand_id, label in pairs_val:
+    for s1_id, cand_id, label, d_score, r_idx in pairs_val:
         s1_rec = s1_dict.get(s1_id, empty_rec)
         c_rec = catalog_dict.get(cand_id, empty_rec)
-        f = fast_15_features(s1_rec, c_rec, cand_id)
+        f = fast_17_features(s1_rec, c_rec, cand_id, dense_score=d_score, rank_idx=r_idx)
+        assert len(f) == 17, f"Feature vector length must be 17, got {len(f)}"
         val_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
                          f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
-                         f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{s1_id},{cand_id},{label}\n")
+                         f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.4f},{f[16]:.1f},{s1_id},{cand_id},{label}\n")
         if label == 1:
             val_pos += 1
         else:
@@ -259,12 +294,12 @@ def find_last_processed_query(csv_path):
         lines = f.read().decode('utf-8', errors='ignore').strip().split('\n')
         for line in reversed(lines):
             parts = line.strip().split(',')
-            if len(parts) >= 17:
+            if len(parts) >= 19:
                 return parts[-3]
     return None
 
 
-def tsv_chunk_generator(tsv_path, chunk_size, val_set, last_s1_id=None, max_chunks=None):
+def tsv_chunk_generator(tsv_path, chunk_size, val_set, last_s1_id=None, max_chunks=None, scores_mmap=None):
     with open(tsv_path, 'r', encoding='utf-8') as f:
         header = f.readline()
         resumed = False if last_s1_id else True
@@ -272,6 +307,7 @@ def tsv_chunk_generator(tsv_path, chunk_size, val_set, last_s1_id=None, max_chun
         
         batch = []
         chunks_count = 0
+        row_counter = 0
         for line in f:
             line = line.strip()
             if not line:
@@ -284,13 +320,21 @@ def tsv_chunk_generator(tsv_path, chunk_size, val_set, last_s1_id=None, max_chun
             
             if not resumed:
                 skipped += 1
+                row_counter += 1
                 if s1_id == last_s1_id:
                     resumed = True
                     print(f"Checkpoint matched! Resuming immediately after query #{skipped:,} ({last_s1_id})...")
                 continue
                 
             is_val = s1_id in val_set
-            batch.append((s1_id, cands_str, is_val))
+            if scores_mmap is not None:
+                cands = [c.strip() for c in cands_str.split(',') if c.strip()]
+                row_scores = scores_mmap[row_counter][:len(cands)]
+                assert len(row_scores) == len(cands), f"Dense scores ({len(row_scores)}) != candidates ({len(cands)}) for {s1_id}"
+                batch.append((s1_id, cands_str, is_val, row_scores))
+            else:
+                batch.append((s1_id, cands_str, is_val))
+            row_counter += 1
             if len(batch) >= chunk_size:
                 yield batch, skipped + chunks_count * chunk_size
                 batch = []
@@ -301,7 +345,7 @@ def tsv_chunk_generator(tsv_path, chunk_size, val_set, last_s1_id=None, max_chun
             yield batch, skipped + chunks_count * chunk_size
 
 
-def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_val_path, resume=True, max_chunks=None):
+def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_val_path, resume=True, max_chunks=None, scores_path=None):
     log_memory("Feature Extraction V3 Start")
     
     db_path = os.path.join(os.path.dirname(out_train_path), "train_catalog_temp.db")
@@ -315,9 +359,25 @@ def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_va
     del val_df
     gc.collect()
     
-    header = ("name_ratio,name_token_sort,name_token_set,name_partial,name_compact_match,name_acronym_match,"
-              "is_addr_missing,street_num_match,street_name_sim,city_state_sim,addr_token_sort,digits_match,"
-              "country_match,is_dba_pattern,source_origin,source1_entity_id,candidate_entity_id,label\n")
+    # Check for dense scores file (best_scores.npy or candidate_dense_scores.npy)
+    scores_mmap = None
+    candidate_scores_paths = [
+        scores_path,
+        os.path.join(os.path.dirname(cands_path), "embeddings_cache", "best_scores.npy"),
+        os.path.join(os.path.dirname(cands_path), "best_scores.npy"),
+        os.path.join(os.path.dirname(cands_path), "candidate_dense_scores.npy")
+    ]
+    for sp in candidate_scores_paths:
+        if sp and os.path.exists(sp):
+            print(f"Loading cached dense scores from: {sp} (mmap)...")
+            scores_mmap = np.load(sp, mmap_mode='r')
+            print(f"  Loaded scores cache: shape={scores_mmap.shape}, dtype={scores_mmap.dtype}")
+            break
+            
+    if scores_mmap is None:
+        print("No dense scores cache found. Defaulting dense_cosine_sim to 0.0.")
+    
+    header = ",".join(FEATURE_COLS) + ",source1_entity_id,candidate_entity_id,label\n"
               
     last_s1 = find_last_processed_query(out_train_path) if resume else None
     
@@ -382,7 +442,7 @@ def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_va
                         
                 return remaining
 
-            for batch, est_offset in tsv_chunk_generator(cands_path, chunk_size, val_set, last_s1_id=last_s1, max_chunks=max_chunks):
+            for batch, est_offset in tsv_chunk_generator(cands_path, chunk_size, val_set, last_s1_id=last_s1, max_chunks=max_chunks, scores_mmap=scores_mmap):
                 while len(futures) >= MAX_IN_FLIGHT:
                     futures = harvest_completed(futures)
                     
@@ -399,7 +459,7 @@ def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_va
                 
     total_elapsed = time.time() - start_time
     print(f"\n{'='*70}")
-    print(f"15-Feature Extraction Complete! (Session finished in {total_elapsed:.1f}s / {total_elapsed/60:.1f}m)")
+    print(f"17-Feature Extraction Complete! (Session finished in {total_elapsed:.1f}s / {total_elapsed/60:.1f}m)")
     print(f"  Train Dataset: {out_train_path} ({os.path.getsize(out_train_path)/(1024**2):.1f} MB)")
     print(f"  Validation Dataset (100% Undownsampled): {out_val_path} ({os.path.getsize(out_val_path)/(1024**2):.1f} MB)")
     print(f"{'='*70}")

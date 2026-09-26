@@ -14,8 +14,10 @@ FEATURE_COLS = [
     'name_compact_match', 'name_acronym_match', 'is_addr_missing',
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
-    'is_dba_pattern', 'source_origin'
+    'is_dba_pattern', 'source_origin',
+    'dense_cosine_sim', 'candidate_rank'
 ]
+assert len(FEATURE_COLS) == 17, f"Expected 17 features, got {len(FEATURE_COLS)}"
 
 COL_DTYPES = {
     'name_ratio': np.float32,
@@ -33,6 +35,8 @@ COL_DTYPES = {
     'country_match': np.float32,
     'is_dba_pattern': np.float32,
     'source_origin': np.float32,
+    'dense_cosine_sim': np.float32,
+    'candidate_rank': np.float32,
     'source1_entity_id': 'str',
     'candidate_entity_id': 'str',
     'label': np.int8

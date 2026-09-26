@@ -20,8 +20,10 @@ FEATURE_COLS = [
     'name_compact_match', 'name_acronym_match', 'is_addr_missing',
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
-    'is_dba_pattern', 'source_origin'
+    'is_dba_pattern', 'source_origin',
+    'dense_cosine_sim', 'candidate_rank'
 ]
+assert len(FEATURE_COLS) == 17, f"Expected 17 features, got {len(FEATURE_COLS)}"
 
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
@@ -113,7 +115,7 @@ def get_worker_xgb(xgb_path):
     return _WORKER_XGB
 
 
-def fast_15_features(s1_rec, c_rec, cand_id):
+def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
     s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
     c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
     
@@ -174,9 +176,20 @@ def fast_15_features(s1_rec, c_rec, cand_id):
     is_dba_pattern = 1.0 if (street_name_sim >= 0.85 and street_num_match == 1.0 and country_match == 1.0) else 0.0
     source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
     
-    return (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
-            is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-            country_match, is_dba_pattern, source_origin)
+    dense_sim = float(dense_score)
+    rank_val = float(rank_idx)
+    assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
+    
+    res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
+           is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
+           country_match, is_dba_pattern, source_origin, dense_sim, rank_val)
+    assert len(res) == 17, f"Expected 17 features, got {len(res)}"
+    return res
+
+
+def fast_15_features(s1_rec, c_rec, cand_id):
+    """Backwards-compatible wrapper returning the first 15 features."""
+    return fast_17_features(s1_rec, c_rec, cand_id, 0.0, 1)[:15]
 
 
 _WORKER_CONN = None
@@ -234,13 +247,23 @@ def process_inference_chunk(args):
         needed_cand_ids = set()
         pairs_list = []
         
-        for s1_id, cands_str in chunk_records:
+        for record in chunk_records:
+            if len(record) == 2:
+                s1_id, cands_str = record
+                scores = None
+            else:
+                s1_id, cands_str, scores = record[:3]
+                
             if not cands_str or cands_str == 'nan':
                 continue
             cands = [c.strip() for c in cands_str.split(',') if c.strip()]
-            for cid in cands:
+            if scores is not None:
+                assert len(scores) == len(cands), f"Number of dense scores ({len(scores)}) != number of candidates ({len(cands)}) for {s1_id}"
+            for rank_idx, cid in enumerate(cands, start=1):
+                assert 1 <= rank_idx <= 30, f"Candidate rank {rank_idx} is out of expected [1, 30] range"
+                d_score = float(scores[rank_idx - 1]) if scores is not None else 0.0
                 needed_cand_ids.add(cid)
-                pairs_list.append((s1_id, cid))
+                pairs_list.append((s1_id, cid, d_score, rank_idx))
                 
         conn = get_worker_conn(db_path)
         cur = conn.cursor()
@@ -272,18 +295,19 @@ def process_inference_chunk(args):
                 catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
             del cat_rows
         
-        # 3. Compute 15 features
+        # 3. Compute 17 features
         num_pairs = len(pairs_list)
         empty_rec = ("", "", "", "", "", "", "", "", "")
         
         if num_pairs > 0:
-            X_feats = np.empty((num_pairs, 15), dtype=np.float32)
+            X_feats = np.empty((num_pairs, 17), dtype=np.float32)
             
-            for i, (s1_id, cand_id) in enumerate(pairs_list):
+            for i, (s1_id, cand_id, d_score, r_idx) in enumerate(pairs_list):
                 s1_rec = s1_dict.get(s1_id, empty_rec)
                 c_rec = catalog_dict.get(cand_id, empty_rec)
-                f = fast_15_features(s1_rec, c_rec, cand_id)
-                for j in range(15):
+                f = fast_17_features(s1_rec, c_rec, cand_id, dense_score=d_score, rank_idx=r_idx)
+                assert len(f) == 17, f"Feature vector length must be 17, got {len(f)}"
+                for j in range(17):
                     X_feats[i, j] = f[j]
                     
             # 4. Predict probabilities with chosen model architecture
@@ -308,7 +332,7 @@ def process_inference_chunk(args):
                 
             # 5. Group candidate probabilities by s1_id
             preds_by_s1 = {}
-            for (s1_id, cand_id), p in zip(pairs_list, probs):
+            for (s1_id, cand_id, _, _), p in zip(pairs_list, probs):
                 if s1_id not in preds_by_s1:
                     preds_by_s1[s1_id] = []
                 preds_by_s1[s1_id].append((cand_id, p))
@@ -349,18 +373,28 @@ def process_inference_chunk(args):
         return chunk_idx, "".join(fallback_lines), 0, len(chunk_records), len(chunk_records)
 
 
-def tsv_chunk_generator(tsv_path, chunk_size):
+def tsv_chunk_generator(tsv_path, chunk_size, scores_mmap=None):
     with open(tsv_path, 'r', encoding='utf-8') as f:
         header = f.readline()
         batch = []
         chunk_idx = 0
+        row_counter = 0
         for line in f:
             line = line.strip()
             if not line:
                 continue
             idx = line.find('\t')
             if idx != -1:
-                batch.append((line[:idx], line[idx+1:]))
+                s1_id = line[:idx]
+                cands_str = line[idx+1:]
+                if scores_mmap is not None:
+                    cands = [c.strip() for c in cands_str.split(',') if c.strip()]
+                    row_scores = scores_mmap[row_counter][:len(cands)]
+                    assert len(row_scores) == len(cands), f"Dense scores ({len(row_scores)}) != candidates ({len(cands)}) for {s1_id}"
+                    batch.append((s1_id, cands_str, row_scores))
+                else:
+                    batch.append((s1_id, cands_str))
+                row_counter += 1
             if len(batch) >= chunk_size:
                 yield chunk_idx, batch
                 chunk_idx += 1
@@ -369,7 +403,7 @@ def tsv_chunk_generator(tsv_path, chunk_size):
             yield chunk_idx, batch
 
 
-def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path):
+def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path, scores_path=None):
     log_memory("Inference Start")
     
     config_path = os.path.join(out_dir, "threshold_config_v3.json")
@@ -393,6 +427,24 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
         threshold = 0.80
         singleton_cutoff = 0.76
         print(f"Config not found at {config_path}. Using fallback mode: {model_mode}, threshold: {threshold}")
+        
+    # Check for dense scores cache (best_scores.npy or candidate_dense_scores.npy)
+    scores_mmap = None
+    candidate_scores_paths = [
+        scores_path,
+        os.path.join(out_dir, "embeddings_cache", "best_scores.npy"),
+        os.path.join(out_dir, "best_scores.npy"),
+        os.path.join(out_dir, "candidate_dense_scores.npy")
+    ]
+    for sp in candidate_scores_paths:
+        if sp and os.path.exists(sp):
+            print(f"Loading cached dense scores from: {sp} (mmap)...")
+            scores_mmap = np.load(sp, mmap_mode='r')
+            print(f"  Loaded scores cache: shape={scores_mmap.shape}, dtype={scores_mmap.dtype}")
+            break
+            
+    if scores_mmap is None:
+        print("No dense scores cache found. Defaulting dense_cosine_sim to 0.0.")
         
     db_path = os.path.join(os.path.dirname(out_matching_path), "test_catalog_temp.db")
     build_test_sqlite_catalog(s1_path, s2_path, s3_path, db_path)
@@ -441,7 +493,7 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
                     
                 return remaining
 
-            for c_idx, batch in tsv_chunk_generator(cands_path, chunk_size):
+            for c_idx, batch in tsv_chunk_generator(cands_path, chunk_size, scores_mmap=scores_mmap):
                 while len(futures) >= MAX_IN_FLIGHT:
                     futures = harvest_and_write(futures)
                     
