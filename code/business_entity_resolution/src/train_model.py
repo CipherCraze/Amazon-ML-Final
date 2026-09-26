@@ -9,7 +9,7 @@ import lightgbm as lgb
 import xgboost as xgb
 from tqdm import tqdm
 
-FEATURE_COLS = [
+FEATURE_COLS_16 = [
     'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
     'name_compact_match', 'name_acronym_match', 'is_addr_missing',
     'street_num_match', 'street_name_sim', 'city_state_sim',
@@ -17,7 +17,14 @@ FEATURE_COLS = [
     'is_dba_pattern', 'source_origin',
     'candidate_rank'
 ]
+
+FEATURE_COLS_18 = FEATURE_COLS_16 + [
+    'name_jaro_winkler', 'addr_both_present'
+]
+
+FEATURE_COLS = FEATURE_COLS_16
 assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS_18) == 18, f"Expected 18 features, got {len(FEATURE_COLS_18)}"
 
 COL_DTYPES = {
     'name_ratio': np.float32,
@@ -36,6 +43,8 @@ COL_DTYPES = {
     'is_dba_pattern': np.float32,
     'source_origin': np.float32,
     'candidate_rank': np.float32,
+    'name_jaro_winkler': np.float32,
+    'addr_both_present': np.float32,
     'source1_entity_id': 'str',
     'candidate_entity_id': 'str',
     'label': np.int8
@@ -158,17 +167,83 @@ def scan_optimal_threshold(val_csv_path, val_probs, val_gt_path, model_label="Mo
     return best_threshold, best_macro_f05, results
 
 
-def load_dataset(csv_path, chunk_size=500000):
+def apply_address_dropout(X, y, feature_cols, dropout_rate=0.10, seed=42):
+    """
+    Applies controlled address dropout during training:
+    For positive training examples (y == 1) where address was present, randomly drops
+    address features with probability `dropout_rate` and sets is_addr_missing=1.0.
+    
+    This forces the model to construct robust split paths where high brand/name similarity
+    can independently trigger a high match probability when address is absent.
+    
+    Deterministic via fixed seed. Validation/test sets and negative examples are never mutated.
+    """
+    if dropout_rate <= 0.0:
+        return X
+        
+    rng = np.random.RandomState(seed)
+    X_aug = X.copy()
+    
+    feat_to_idx = {name: i for i, name in enumerate(feature_cols)}
+    is_missing_idx = feat_to_idx.get('is_addr_missing')
+    both_present_idx = feat_to_idx.get('addr_both_present')
+    street_num_idx = feat_to_idx.get('street_num_match')
+    street_name_idx = feat_to_idx.get('street_name_sim')
+    city_state_idx = feat_to_idx.get('city_state_sim')
+    addr_token_idx = feat_to_idx.get('addr_token_sort')
+    digits_idx = feat_to_idx.get('digits_match')
+    dba_idx = feat_to_idx.get('is_dba_pattern')
+    
+    if is_missing_idx is not None:
+        pos_mask = (y == 1) & (X_aug[:, is_missing_idx] == 0.0)
+    else:
+        pos_mask = (y == 1)
+        
+    pos_indices = np.where(pos_mask)[0]
+    num_to_drop = int(len(pos_indices) * dropout_rate)
+    
+    if num_to_drop > 0:
+        drop_indices = rng.choice(pos_indices, size=num_to_drop, replace=False)
+        if is_missing_idx is not None:
+            X_aug[drop_indices, is_missing_idx] = 1.0
+        if both_present_idx is not None:
+            X_aug[drop_indices, both_present_idx] = 0.0
+        if street_num_idx is not None:
+            X_aug[drop_indices, street_num_idx] = 0.5
+        if street_name_idx is not None:
+            X_aug[drop_indices, street_name_idx] = 0.0
+        if city_state_idx is not None:
+            X_aug[drop_indices, city_state_idx] = 0.0
+        if addr_token_idx is not None:
+            X_aug[drop_indices, addr_token_idx] = 0.0
+        if digits_idx is not None:
+            X_aug[drop_indices, digits_idx] = 0.0
+        if dba_idx is not None:
+            X_aug[drop_indices, dba_idx] = 0.0
+            
+        print(f"  [Address Dropout] Applied dropout rate {dropout_rate:.2f} to {num_to_drop:,} / {len(pos_indices):,} positive training samples.")
+        
+    return X_aug
+
+
+def load_dataset(csv_path, chunk_size=500000, feature_cols=None):
     log_memory(f"Loading {os.path.basename(csv_path)}")
     X_chunks = []
     y_chunks = []
     
+    if feature_cols is None:
+        first_line = pd.read_csv(csv_path, nrows=1)
+        if 'name_jaro_winkler' in first_line.columns:
+            feature_cols = FEATURE_COLS_18
+        else:
+            feature_cols = FEATURE_COLS_16
+            
     total_rows = 0
     t0 = time.time()
     
-    for chunk in pd.read_csv(csv_path, chunksize=chunk_size, usecols=FEATURE_COLS + ['label'], dtype=COL_DTYPES):
+    for chunk in pd.read_csv(csv_path, chunksize=chunk_size, usecols=feature_cols + ['label'], dtype=COL_DTYPES):
         total_rows += len(chunk)
-        X_chunks.append(chunk[FEATURE_COLS].to_numpy(dtype=np.float32))
+        X_chunks.append(chunk[feature_cols].to_numpy(dtype=np.float32))
         y_chunks.append(chunk['label'].to_numpy(dtype=np.int8))
             
     X = np.vstack(X_chunks)
@@ -177,13 +252,13 @@ def load_dataset(csv_path, chunk_size=500000):
     gc.collect()
     
     elapsed = time.time() - t0
-    print(f"Loaded {total_rows:,} rows from {csv_path} in {elapsed:.1f}s ({X.nbytes / (1024**2):.1f} MB matrix).")
+    print(f"Loaded {total_rows:,} rows from {csv_path} in {elapsed:.1f}s ({X.nbytes / (1024**2):.1f} MB matrix with {len(feature_cols)} features).")
     log_memory("After array consolidation")
     
-    return X, y
+    return X, y, feature_cols
 
 
-def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
+def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir, address_dropout=0.0, feature_cols=None):
     log_memory("Pipeline Start")
     
     out_lgb_model = os.path.join(out_dir, "lgbm_model_v3.txt")
@@ -204,11 +279,15 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
         print("=== MODEL 1: Training High-Capacity LightGBM Booster (800 Trees) ===")
         print("="*60)
         print(f"\n=== Loading Training & Validation Data for LightGBM ===")
-        X_train, y_train = load_dataset(train_csv)
-        X_val, y_val = load_dataset(val_csv)
+        X_train, y_train, detected_cols = load_dataset(train_csv, feature_cols=feature_cols)
+        X_val, y_val, _ = load_dataset(val_csv, feature_cols=detected_cols)
+        feature_cols = detected_cols
         
-        train_data_lgb = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_COLS, free_raw_data=True)
-        val_data_lgb = lgb.Dataset(X_val, label=y_val, feature_name=FEATURE_COLS, reference=train_data_lgb, free_raw_data=False)
+        if address_dropout > 0.0:
+            X_train = apply_address_dropout(X_train, y_train, feature_cols=feature_cols, dropout_rate=address_dropout)
+            
+        train_data_lgb = lgb.Dataset(X_train, label=y_train, feature_name=feature_cols, free_raw_data=True)
+        val_data_lgb = lgb.Dataset(X_val, label=y_val, feature_name=feature_cols, reference=train_data_lgb, free_raw_data=False)
         del X_train, y_train
         gc.collect()
         log_memory("After LGBM Dataset Construction")
@@ -263,15 +342,18 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
         print("=== MODEL 2: Training High-Capacity XGBoost Booster (800 Trees) ===")
         print("="*60)
         print(f"\n=== Loading Training & Validation Data for XGBoost ===")
-        X_train, y_train = load_dataset(train_csv)
-        X_val, y_val = load_dataset(val_csv)
+        X_train, y_train, _ = load_dataset(train_csv, feature_cols=feature_cols)
+        X_val, y_val, _ = load_dataset(val_csv, feature_cols=feature_cols)
         
+        if address_dropout > 0.0:
+            X_train = apply_address_dropout(X_train, y_train, feature_cols=feature_cols, dropout_rate=address_dropout)
+            
         t0 = time.time()
-        dtrain_xgb = xgb.DMatrix(X_train, label=y_train, feature_names=FEATURE_COLS)
+        dtrain_xgb = xgb.DMatrix(X_train, label=y_train, feature_names=feature_cols)
         del X_train, y_train
         gc.collect()
         
-        dval_xgb = xgb.DMatrix(X_val, label=y_val, feature_names=FEATURE_COLS)
+        dval_xgb = xgb.DMatrix(X_val, label=y_val, feature_names=feature_cols)
         del X_val, y_val
         gc.collect()
         log_memory("After XGBoost DMatrix Construction")
@@ -357,7 +439,8 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
         "lgbm_score": f05_lgb,
         "xgb_score": f05_xgb,
         "ensemble_score": f05_ens,
-        "features": FEATURE_COLS,
+        "features": feature_cols if feature_cols else FEATURE_COLS,
+        "address_dropout": float(address_dropout),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
     with open(out_config, 'w', encoding='utf-8') as f:
@@ -367,11 +450,12 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Train LightGBM Model (16 features)")
+    parser = argparse.ArgumentParser(description="Train LightGBM Model")
     parser.add_argument("--out-dir", default=None, help="Output directory for model and config")
     parser.add_argument("--train-csv", default=None, help="Path to full_train_features_v3.csv")
     parser.add_argument("--val-csv", default=None, help="Path to full_val_features_v3.csv")
     parser.add_argument("--val-gt", default=None, help="Path to val_gt_split.tsv")
+    parser.add_argument("--address-dropout", default=0.0, type=float, help="Address dropout augmentation rate (e.g. 0.00, 0.05, 0.10, 0.15)")
     args = parser.parse_args()
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -382,4 +466,4 @@ if __name__ == "__main__":
     val_csv = args.val_csv or os.path.join(out_dir, "full_val_features_v3.csv")
     val_gt = args.val_gt or os.path.join(out_dir, "val_gt_split.tsv")
     
-    train_and_evaluate(train_csv, val_csv, val_gt, out_dir)
+    train_and_evaluate(train_csv, val_csv, val_gt, out_dir, address_dropout=args.address_dropout)

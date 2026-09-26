@@ -9,10 +9,11 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import pandas as pd
 from tqdm import tqdm
 from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
 
 from preprocess import normalize_text, get_compact_signature, get_acronym, decompose_address
 
-FEATURE_COLS = [
+FEATURE_COLS_16 = [
     'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
     'name_compact_match', 'name_acronym_match', 'is_addr_missing',
     'street_num_match', 'street_name_sim', 'city_state_sim',
@@ -20,7 +21,14 @@ FEATURE_COLS = [
     'is_dba_pattern', 'source_origin',
     'candidate_rank'
 ]
+
+FEATURE_COLS_18 = FEATURE_COLS_16 + [
+    'name_jaro_winkler', 'addr_both_present'
+]
+
+FEATURE_COLS = FEATURE_COLS_16
 assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS_18) == 18, f"Expected 18 features, got {len(FEATURE_COLS_18)}"
 
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
@@ -164,6 +172,25 @@ def fast_16_features(s1_rec, c_rec, cand_id, rank_idx=1):
     return fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)
 
 
+def fast_18_features(s1_rec, c_rec, cand_id, rank_idx=1):
+    """Computes the 18-feature vector (16 baseline + Jaro-Winkler + addr_both_present)."""
+    f16 = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=rank_idx)
+    s1_name = s1_rec[0]
+    c_name = c_rec[0]
+    s1_addr = s1_rec[3]
+    c_addr = c_rec[3]
+    
+    if s1_name and c_name:
+        name_jw = float(JaroWinkler.similarity(s1_name, c_name))
+    else:
+        name_jw = 0.0
+        
+    addr_both_present = 1.0 if (s1_addr and c_addr) else 0.0
+    res = f16 + (name_jw, addr_both_present)
+    assert len(res) == 18, f"Expected 18 features, got {len(res)}"
+    return res
+
+
 def fast_15_features(s1_rec, c_rec, cand_id):
     """Backwards-compatible wrapper returning the first 15 features."""
     return fast_16_features(s1_rec, c_rec, cand_id, 1)[:15]
@@ -265,7 +292,8 @@ def process_chunk(args):
     4. Pre-normalizes names and addresses once.
     5. Computes the 16 features (15 baseline + candidate_rank) and formats directly as CSV strings.
     """
-    chunk_records, db_path = args
+    chunk_records, db_path = args[:2]
+    feature_mode = args[2] if len(args) > 2 else "16"
     
     s1_needed = [r[0] for r in chunk_records]
     if not s1_needed:
@@ -344,11 +372,17 @@ def process_chunk(args):
     for s1_id, cand_id, label, r_idx in pairs_train:
         s1_rec = s1_dict.get(s1_id, empty_rec)
         c_rec = catalog_dict.get(cand_id, empty_rec)
-        f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
-        assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
-        train_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
-                           f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
-                           f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{s1_id},{cand_id},{label}\n")
+        if feature_mode == "18":
+            f = fast_18_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+            f_str = f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f}," \
+                    f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f}," \
+                    f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{f[16]:.4f},{f[17]:.1f}"
+            train_lines.append(f"{f_str},{s1_id},{cand_id},{label}\n")
+        else:
+            f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+            train_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
+                               f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
+                               f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{s1_id},{cand_id},{label}\n")
         if label == 1:
             train_pos += 1
         else:
@@ -357,11 +391,17 @@ def process_chunk(args):
     for s1_id, cand_id, label, r_idx in pairs_val:
         s1_rec = s1_dict.get(s1_id, empty_rec)
         c_rec = catalog_dict.get(cand_id, empty_rec)
-        f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
-        assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
-        val_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
-                         f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
-                         f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{s1_id},{cand_id},{label}\n")
+        if feature_mode == "18":
+            f = fast_18_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+            f_str = f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f}," \
+                    f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f}," \
+                    f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{f[16]:.4f},{f[17]:.1f}"
+            val_lines.append(f"{f_str},{s1_id},{cand_id},{label}\n")
+        else:
+            f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+            val_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
+                             f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
+                             f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{s1_id},{cand_id},{label}\n")
         if label == 1:
             val_pos += 1
         else:
@@ -491,7 +531,7 @@ def build_train_sqlite_catalog(s1_path, s2_path, s3_path, gt_path, db_path):
     print("  SQLite train database ready!")
 
 
-def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_val_path, resume=True, max_chunks=None, scores_path=None, db_path=None):
+def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_val_path, resume=True, max_chunks=None, scores_path=None, db_path=None, feature_mode="16"):
     log_memory("Feature Extraction V3 Start")
     
     if db_path is None:
@@ -524,7 +564,8 @@ def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_va
     if scores_mmap is None:
         print("No dense scores cache found. Defaulting dense_cosine_sim to 0.0.")
     
-    header = ",".join(FEATURE_COLS) + ",source1_entity_id,candidate_entity_id,label\n"
+    active_cols = FEATURE_COLS_18 if feature_mode == "18" else FEATURE_COLS_16
+    header = ",".join(active_cols) + ",source1_entity_id,candidate_entity_id,label\n"
               
     last_s1 = find_last_processed_query(out_train_path) if resume else None
     
@@ -599,7 +640,7 @@ def build_v3_feature_datasets(cands_path, val_split_path, out_train_path, out_va
                     time.sleep(2.0)
                     mem = psutil.virtual_memory()
                     
-                futures.add(executor.submit(process_chunk, (batch, db_path)))
+                futures.add(executor.submit(process_chunk, (batch, db_path, feature_mode)))
                 
             while futures:
                 futures = harvest_completed(futures)
