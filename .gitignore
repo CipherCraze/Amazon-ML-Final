@@ -1,0 +1,35 @@
+# Large Raw Datasets (multi-GB source files)
+student_resource/dataset/
+dataset/
+*.tsv.gz
+*.zip
+
+# SQLite Temporary Catalogs
+*.db
+*.db-journal
+*.db-wal
+
+# Embeddings Cache & Large Arrays
+output/embeddings_cache/
+*.npy
+*.npz
+
+# Intermediate Feature Datasets & Scratch
+output/*_features*.csv
+output/demo_train_features.csv
+scratch/
+
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+Thumbs.db
+
+# Environment & IDE
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.log
