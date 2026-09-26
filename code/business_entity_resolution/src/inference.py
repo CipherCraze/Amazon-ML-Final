@@ -334,7 +334,16 @@ def process_inference_chunk(args):
     4. Evaluates matches with calibrated threshold and singleton guard.
     5. Formats output TSV lines in strictly preserved query order.
     """
-    chunk_idx, chunk_records, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff = args
+    chunk_idx = args[0]
+    chunk_records = args[1]
+    db_path = args[2]
+    model_mode = args[3]
+    lgb_path = args[4]
+    xgb_path = args[5]
+    threshold = args[6]
+    singleton_cutoff = args[7]
+    fallback_threshold = args[8] if len(args) > 8 else None
+    name_threshold = args[9] if len(args) > 9 else 0.90
     
     if not chunk_records:
         return chunk_idx, "", 0, 0, 0
@@ -421,23 +430,42 @@ def process_inference_chunk(args):
                 bst_lgb = get_worker_lgb(lgb_path)
                 probs = bst_lgb.predict(X_feats)
                 
-            # 5. Group candidate probabilities by s1_id
+            # 5. Group candidate probabilities and metadata by s1_id
             preds_by_s1 = {}
-            for (s1_id, cand_id, _), p in zip(pairs_list, probs):
+            for i, (s1_id, cand_id, _) in enumerate(pairs_list):
+                p = float(probs[i])
+                is_missing = bool(X_feats[i, 6] == 1.0) # is_addr_missing
+                name_sim = float(max(X_feats[i, 0], X_feats[i, 2])) # max(name_ratio, name_token_set)
+                compact_m = bool(X_feats[i, 4] == 1.0)
+                country_m = bool(X_feats[i, 12] == 1.0)
+                
                 if s1_id not in preds_by_s1:
                     preds_by_s1[s1_id] = []
-                preds_by_s1[s1_id].append((cand_id, p))
+                preds_by_s1[s1_id].append((cand_id, p, is_missing, name_sim, compact_m, country_m))
                 
-            # 6. Apply threshold and singleton guard
+            # 6. Apply threshold and singleton guard (supporting conditional missing-address fallback)
             matches_by_s1 = {}
-            for s1_id, cand_probs in preds_by_s1.items():
-                max_p = max(p for _, p in cand_probs)
-                if max_p < singleton_cutoff:
+            for s1_id, cand_items in preds_by_s1.items():
+                max_p = max(item[1] for item in cand_items)
+                
+                matched_cands = []
+                for cid, p, is_missing, name_sim, compact_m, country_m in cand_items:
+                    # 1. Standard decision threshold
+                    if p >= threshold:
+                        matched_cands.append(cid)
+                    # 2. Conditional missing-address fallback (Opt-in)
+                    elif (fallback_threshold is not None
+                          and fallback_threshold < threshold
+                          and p >= fallback_threshold
+                          and is_missing
+                          and country_m
+                          and (name_sim >= name_threshold or compact_m)):
+                        matched_cands.append(cid)
+                        
+                if max_p < singleton_cutoff and not matched_cands:
                     matches_by_s1[s1_id] = []
-                    continue
-                    
-                matched_cands = [cid for cid, p in cand_probs if p >= threshold]
-                matches_by_s1[s1_id] = matched_cands
+                else:
+                    matches_by_s1[s1_id] = matched_cands
         else:
             matches_by_s1 = {}
             
@@ -494,7 +522,7 @@ def tsv_chunk_generator(tsv_path, chunk_size, scores_mmap=None):
             yield chunk_idx, batch
 
 
-def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path, scores_path=None):
+def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path, scores_path=None, fallback_threshold=None, name_threshold=0.90, policy_mode="baseline"):
     log_memory("Inference Start")
     
     config_path = os.path.join(out_dir, "threshold_config_v3.json")
@@ -508,10 +536,19 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
             model_mode = cfg.get('model_mode', 'ensemble')
             threshold = float(cfg.get('optimal_threshold', 0.80))
             singleton_cutoff = float(cfg.get('singleton_cutoff', max(0.75, threshold - 0.05)))
+            if fallback_threshold is None:
+                fallback_threshold = cfg.get('fallback_threshold', None)
+            if fallback_threshold is not None:
+                fallback_threshold = float(fallback_threshold)
+            cfg_name_thresh = cfg.get('name_threshold', None)
+            if cfg_name_thresh is not None:
+                name_threshold = float(cfg_name_thresh)
             print(f"Loaded tuned configuration:")
             print(f"  - Model Architecture: {model_mode.upper()}")
             print(f"  - Decision Threshold: {threshold}")
             print(f"  - Singleton Safeguard Cutoff: {singleton_cutoff}")
+            if fallback_threshold is not None and fallback_threshold < threshold:
+                print(f"  - Conditional Missing-Address Fallback: Enabled (Fallback: {fallback_threshold}, Name Threshold: {name_threshold})")
             print(f"  - Validation Macro F0.5: {cfg.get('validation_macro_f05', 0):.5f}")
     else:
         model_mode = "lgbm"
@@ -596,7 +633,7 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
                     
                 futures.add(executor.submit(
                     process_inference_chunk,
-                    (c_idx, batch, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff)
+                    (c_idx, batch, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff, fallback_threshold, name_threshold)
                 ))
                 
                 if (c_idx + 1) % 50 == 0:
