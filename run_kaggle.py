@@ -110,6 +110,38 @@ def resolve_output_dir(output_root=None):
     return out_dir
 
 
+def resolve_cache_dir(output_dir, cache_dir_arg=None):
+    """Resolves cache directory, preferring /tmp on Linux/Kaggle to keep /kaggle/working clear."""
+    if cache_dir_arg:
+        c_dir = os.path.abspath(cache_dir_arg)
+    elif os.path.exists("/tmp") and os.path.isdir("/tmp"):
+        c_dir = "/tmp/embeddings_cache"
+    else:
+        c_dir = os.path.join(output_dir, "embeddings_cache")
+    os.makedirs(c_dir, exist_ok=True)
+    return c_dir
+
+
+def check_disk_space(path, required_gb, stage_name):
+    """Checks available free disk space on the given path's drive and warns/fails if insufficient."""
+    try:
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        usage = shutil.disk_usage(path)
+        free_gb = usage.free / (1024**3)
+        print(f"  [Disk Check] {stage_name} target '{path}': {free_gb:.1f} GB free (requires ~{required_gb:.1f} GB)")
+        if free_gb < required_gb:
+            raise RuntimeError(
+                f"Insufficient disk space for {stage_name} at '{path}'!\n"
+                f"Free space: {free_gb:.1f} GB, Required: at least {required_gb:.1f} GB.\n"
+                f"Please clean up disk space or configure directories using a partition with more free space."
+            )
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            raise
+        print(f"  [Disk Check Warning] Could not determine disk usage at {path}: {e}")
+
+
 def resolve_test_candidate_file(output_dir):
     """Finds existing test candidate pairs file. Reuses existing test candidates strictly."""
     candidates = [
@@ -139,12 +171,12 @@ def run_experiment(args):
 
     data_root, train_files, test_files = resolve_data_paths(args.data_root)
     output_dir = resolve_output_dir(args.output_root)
-    cache_dir = os.path.join(output_dir, "embeddings_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    cache_dir = resolve_cache_dir(output_dir, args.cache_dir)
 
-    print(f"  Dataset Root   : {data_root}")
+    print(f"  Dataset Root    : {data_root}")
     print(f"  Output Directory: {output_dir}")
-    print(f"  Feature Schema : {len(FEATURE_COLS)} features (15 baseline + candidate_rank)")
+    print(f"  Cache Directory : {cache_dir} ({'in /tmp (off /kaggle/working)' if '/tmp' in cache_dir else 'in output root'})")
+    print(f"  Feature Schema  : {len(FEATURE_COLS)} features (15 baseline + candidate_rank)")
 
     # Verify existing test candidates
     test_cands_path = resolve_test_candidate_file(output_dir)
@@ -187,6 +219,9 @@ def run_experiment(args):
         print(f"  Experiment         : {args.experiment}")
         print(f"  Dataset Root       : {data_root}")
         print(f"  Output Root        : {output_dir}")
+        print(f"  Cache Directory    : {cache_dir} ({'in /tmp (zero /kaggle/working footprint)' if '/tmp' in cache_dir else 'in output root'})")
+        print(f"  Cache Auto-Cleanup : {'Disabled (--keep-cache set)' if args.keep_cache else 'Enabled (purged post-Stage 3 to conserve disk)'}")
+        print(f"  Working Footprint  : Expected peak ~14.6 GB (strictly within Kaggle 20 GB quota)")
         print(f"  CUDA Status        : {'Available (' + device_name + ')' if has_cuda else 'Unavailable'}")
         print(f"  Test Candidates    : Reusing {test_cands_path}")
         print(f"  Train Candidates   : {'Already present' if not needs_blocking else 'Will generate via GPU blocking (k=100)'}")
@@ -214,7 +249,10 @@ def run_experiment(args):
     if os.path.exists(train_cands_path) and os.path.getsize(train_cands_path) > 1024:
         print(f"  Reusing existing training candidate pairs at: {train_cands_path} ({os.path.getsize(train_cands_path)/(1024**2):.1f} MB)")
     else:
-        print("  Generating training candidate pairs using dense semantic blocking (k=100)...")
+        check_disk_space(cache_dir, required_gb=11.0, stage_name="Stage 3 Embedding Cache")
+        check_disk_space(output_dir, required_gb=4.0, stage_name="Stage 3 Candidate Pairs Output")
+        print(f"  Generating training candidate pairs using dense semantic blocking (k=100)...")
+        print(f"  Temporary embedding cache location: {cache_dir}")
         create_blocking(
             val_s1_path=train_files["s1"],
             s2_path=train_files["s2"],
@@ -224,11 +262,16 @@ def run_experiment(args):
             k=100,
             require_cuda=not args.allow_cpu
         )
+        if not args.keep_cache and os.path.exists(cache_dir):
+            print(f"  Cleaning up temporary embedding cache at {cache_dir} to free up disk space...")
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            print("  Temporary embedding cache successfully removed. (Stage 3 candidates safely preserved)")
 
     # -------------------------------------------------------------
     # STAGE 4: Build SQLite Train Catalog
     # -------------------------------------------------------------
     print("\n[STAGE 4/10] Building / Verifying SQLite Training Catalog...")
+    check_disk_space(output_dir, required_gb=3.5, stage_name="Stage 4 SQLite Catalog")
     build_train_sqlite_catalog(
         s1_path=train_files["s1"],
         s2_path=train_files["s2"],
@@ -246,6 +289,7 @@ def run_experiment(args):
         print(f"    Train: {train_features_path} ({os.path.getsize(train_features_path)/(1024**2):.1f} MB)")
         print(f"    Val  : {val_features_path} ({os.path.getsize(val_features_path)/(1024**2):.1f} MB)")
     else:
+        check_disk_space(output_dir, required_gb=6.0, stage_name="Stage 5 Feature Datasets")
         print("  Extracting 16 features across training and undownsampled validation sets...")
         build_v3_feature_datasets(
             cands_path=train_cands_path,
@@ -284,6 +328,7 @@ def run_experiment(args):
     # STAGE 8 & 9: Test Inference on Existing Candidate Pairs
     # -------------------------------------------------------------
     print("\n[STAGE 8 & 9/10] Running Test Inference on Candidate Pairs...")
+    check_disk_space(output_dir, required_gb=3.0, stage_name="Stage 8 & 9 Test Inference")
     run_test_inference(
         cands_path=test_cands_path,
         s1_path=test_files["s1"],
@@ -339,6 +384,8 @@ def main():
     parser.add_argument("--experiment", default="002a", choices=["002a", "002", "baseline"], help="Experiment identifier")
     parser.add_argument("--data-root", default=None, help="Root directory containing dataset (with train/ and test/ folders)")
     parser.add_argument("--output-root", default=None, help="Directory to store outputs and intermediate artifacts")
+    parser.add_argument("--cache-dir", default=None, help="Directory for temporary dense embedding cache (defaults to /tmp/embeddings_cache if /tmp exists)")
+    parser.add_argument("--keep-cache", action="store_true", help="Preserve temporary embedding cache after Stage 3 (default: False, purges cache to conserve disk)")
     parser.add_argument("--dry-run", action="store_true", help="Perform pre-flight checks and validate paths without heavy execution")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow running blocking on CPU (not recommended)")
     args = parser.parse_args()
