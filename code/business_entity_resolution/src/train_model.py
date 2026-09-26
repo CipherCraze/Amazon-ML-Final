@@ -258,15 +258,15 @@ def load_dataset(csv_path, chunk_size=500000, feature_cols=None):
     return X, y, feature_cols
 
 
-def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir, address_dropout=0.0, feature_cols=None):
+def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir, address_dropout=0.0, feature_cols=None, model_tag="v3"):
     log_memory("Pipeline Start")
     
-    out_lgb_model = os.path.join(out_dir, "lgbm_model_v3.txt")
-    out_xgb_model = os.path.join(out_dir, "xgb_model_v3.json")
-    out_config = os.path.join(out_dir, "threshold_config_v3.json")
+    out_lgb_model = os.path.join(out_dir, f"lgbm_model_{model_tag}.txt")
+    out_xgb_model = os.path.join(out_dir, f"xgb_model_{model_tag}.json")
+    out_config = os.path.join(out_dir, f"threshold_config_{model_tag}.json")
     num_cores = min(6, os.cpu_count())
-    val_probs_lgb_path = os.path.join(out_dir, "val_probs_lgb_v3.npy")
-    val_probs_xgb_path = os.path.join(out_dir, "val_probs_xgb_v3.npy")
+    val_probs_lgb_path = os.path.join(out_dir, f"val_probs_lgb_{model_tag}.npy")
+    val_probs_xgb_path = os.path.join(out_dir, f"val_probs_xgb_{model_tag}.npy")
     
     # -------------------------------------------------------------
     # MODEL 1: High-Capacity LightGBM Booster

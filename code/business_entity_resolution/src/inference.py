@@ -12,10 +12,11 @@ import xgboost as xgb
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
 
 from preprocess import normalize_text, get_compact_signature, get_acronym, decompose_address
 
-FEATURE_COLS = [
+FEATURE_COLS_16 = [
     'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
     'name_compact_match', 'name_acronym_match', 'is_addr_missing',
     'street_num_match', 'street_name_sim', 'city_state_sim',
@@ -23,7 +24,14 @@ FEATURE_COLS = [
     'is_dba_pattern', 'source_origin',
     'candidate_rank'
 ]
+
+FEATURE_COLS_18 = FEATURE_COLS_16 + [
+    'name_jaro_winkler', 'addr_both_present'
+]
+
+FEATURE_COLS = FEATURE_COLS_16
 assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS_18) == 18, f"Expected 18 features, got {len(FEATURE_COLS_18)}"
 
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
@@ -197,6 +205,25 @@ def fast_16_features(s1_rec, c_rec, cand_id, rank_idx=1):
     return fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)
 
 
+def fast_18_features(s1_rec, c_rec, cand_id, rank_idx=1):
+    """Computes the 18-feature vector (16 baseline + Jaro-Winkler + addr_both_present)."""
+    f16 = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=rank_idx)
+    s1_name = s1_rec[0]
+    c_name = c_rec[0]
+    s1_addr = s1_rec[3]
+    c_addr = c_rec[3]
+    
+    if s1_name and c_name:
+        name_jw = float(JaroWinkler.similarity(s1_name, c_name))
+    else:
+        name_jw = 0.0
+        
+    addr_both_present = 1.0 if (s1_addr and c_addr) else 0.0
+    res = f16 + (name_jw, addr_both_present)
+    assert len(res) == 18, f"Expected 18 features, got {len(res)}"
+    return res
+
+
 def fast_15_features(s1_rec, c_rec, cand_id):
     """Backwards-compatible wrapper returning the first 15 features."""
     return fast_16_features(s1_rec, c_rec, cand_id, 1)[:15]
@@ -344,6 +371,7 @@ def process_inference_chunk(args):
     singleton_cutoff = args[7]
     fallback_threshold = args[8] if len(args) > 8 else None
     name_threshold = args[9] if len(args) > 9 else 0.90
+    feature_mode = args[10] if len(args) > 10 else "16"
     
     if not chunk_records:
         return chunk_idx, "", 0, 0, 0
@@ -395,19 +423,24 @@ def process_inference_chunk(args):
                 catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
             del cat_rows
         
-        # 3. Compute 16 features
+        # 3. Compute features (16 or 18 based on model architecture)
         num_pairs = len(pairs_list)
         empty_rec = ("", "", "", "", "", "", "", "", "")
+        feat_cols = FEATURE_COLS_18 if feature_mode == "18" else FEATURE_COLS_16
+        n_feats = len(feat_cols)
         
         if num_pairs > 0:
-            X_feats = np.empty((num_pairs, 16), dtype=np.float32)
+            X_feats = np.empty((num_pairs, n_feats), dtype=np.float32)
             
             for i, (s1_id, cand_id, r_idx) in enumerate(pairs_list):
                 s1_rec = s1_dict.get(s1_id, empty_rec)
                 c_rec = catalog_dict.get(cand_id, empty_rec)
-                f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
-                assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
-                for j in range(16):
+                if feature_mode == "18":
+                    f = fast_18_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+                else:
+                    f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
+                assert len(f) == n_feats, f"Feature vector length must be {n_feats}, got {len(f)}"
+                for j in range(n_feats):
                     X_feats[i, j] = f[j]
                     
             # 4. Predict probabilities with chosen model architecture
@@ -416,14 +449,14 @@ def process_inference_chunk(args):
                 probs_lgb = bst_lgb.predict(X_feats)
                 
                 bst_xgb = get_worker_xgb(xgb_path)
-                dmat = xgb.DMatrix(X_feats, feature_names=FEATURE_COLS)
+                dmat = xgb.DMatrix(X_feats, feature_names=feat_cols)
                 probs_xgb = bst_xgb.predict(dmat)
                 del dmat
                 
                 probs = 0.5 * probs_lgb + 0.5 * probs_xgb
             elif model_mode == "xgboost":
                 bst_xgb = get_worker_xgb(xgb_path)
-                dmat = xgb.DMatrix(X_feats, feature_names=FEATURE_COLS)
+                dmat = xgb.DMatrix(X_feats, feature_names=feat_cols)
                 probs = bst_xgb.predict(dmat)
                 del dmat
             else: # lgbm
@@ -522,12 +555,15 @@ def tsv_chunk_generator(tsv_path, chunk_size, scores_mmap=None):
             yield chunk_idx, batch
 
 
-def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path, scores_path=None, fallback_threshold=None, name_threshold=0.90, policy_mode="baseline"):
+def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path, scores_path=None, fallback_threshold=None, name_threshold=0.90, policy_mode="baseline", config_path=None, lgb_path=None, xgb_path=None):
     log_memory("Inference Start")
     
-    config_path = os.path.join(out_dir, "threshold_config_v3.json")
-    lgb_path = os.path.join(out_dir, "lgbm_model_v3.txt")
-    xgb_path = os.path.join(out_dir, "xgb_model_v3.json")
+    if config_path is None:
+        config_path = os.path.join(out_dir, "threshold_config_v3.json")
+    if lgb_path is None:
+        lgb_path = os.path.join(out_dir, "lgbm_model_v3.txt")
+    if xgb_path is None:
+        xgb_path = os.path.join(out_dir, "xgb_model_v3.json")
     
     # 1. Load optimal threshold and model mode
     if os.path.exists(config_path):
@@ -543,8 +579,10 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
             cfg_name_thresh = cfg.get('name_threshold', None)
             if cfg_name_thresh is not None:
                 name_threshold = float(cfg_name_thresh)
+            cfg_feats = cfg.get('features', [])
+            feature_mode = "18" if len(cfg_feats) == 18 else "16"
             print(f"Loaded tuned configuration:")
-            print(f"  - Model Architecture: {model_mode.upper()}")
+            print(f"  - Model Architecture: {model_mode.upper()} ({len(cfg_feats)} features, mode={feature_mode})")
             print(f"  - Decision Threshold: {threshold}")
             print(f"  - Singleton Safeguard Cutoff: {singleton_cutoff}")
             if fallback_threshold is not None and fallback_threshold < threshold:
@@ -633,7 +671,7 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
                     
                 futures.add(executor.submit(
                     process_inference_chunk,
-                    (c_idx, batch, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff, fallback_threshold, name_threshold)
+                    (c_idx, batch, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff, fallback_threshold, name_threshold, feature_mode)
                 ))
                 
                 if (c_idx + 1) % 50 == 0:

@@ -23,12 +23,14 @@ if SRC_DIR not in sys.path:
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+import time
 import torch
 from create_validation_split import create_splits
 from blocking import create_blocking
-from feature_engineering import build_train_sqlite_catalog, build_v3_feature_datasets, FEATURE_COLS
+from feature_engineering import build_train_sqlite_catalog, build_v3_feature_datasets, FEATURE_COLS, FEATURE_COLS_18
 from train_model import train_and_evaluate
 from inference import run_test_inference
+from experiment_tracker import record_experiment_result
 
 
 def resolve_data_paths(data_root=None):
@@ -156,9 +158,35 @@ def resolve_test_candidate_file(output_dir):
 
 
 def run_experiment(args):
+    t_run_start = time.time()
     print("=" * 75)
     print(f"  AMAZON ML CHALLENGE 2026 — EXPERIMENT RUNNER: {args.experiment.upper()}")
     print("=" * 75)
+
+    # -------------------------------------------------------------
+    # Experiment Configuration & Parameters
+    # -------------------------------------------------------------
+    if args.experiment in ["004", "008"]:
+        feature_mode = "18"
+        active_feature_cols = FEATURE_COLS_18
+        dropout_rate = args.address_dropout if args.address_dropout > 0.0 else (0.10 if args.experiment == "008" else 0.0)
+    else:
+        feature_mode = "16"
+        active_feature_cols = FEATURE_COLS
+        dropout_rate = args.address_dropout
+
+    if args.experiment in ["003", "008"]:
+        fallback_threshold = args.fallback_threshold if args.fallback_threshold is not None else 0.55
+    else:
+        fallback_threshold = args.fallback_threshold
+
+    # For Experiment 002A / baseline, use exact original names for 100% backward reproducibility:
+    if args.experiment in ["002a", "002", "baseline"]:
+        exp_tag = "v3"
+        out_matching_filename = "matching_results.tsv"
+    else:
+        exp_tag = f"exp_{args.experiment}"
+        out_matching_filename = f"matching_results_{exp_tag}.tsv"
 
     # -------------------------------------------------------------
     # STAGE 1: Environment & Path Validation
@@ -176,7 +204,10 @@ def run_experiment(args):
     print(f"  Dataset Root    : {data_root}")
     print(f"  Output Directory: {output_dir}")
     print(f"  Cache Directory : {cache_dir} ({'in /tmp (off /kaggle/working)' if '/tmp' in cache_dir else 'in output root'})")
-    print(f"  Feature Schema  : {len(FEATURE_COLS)} features (15 baseline + candidate_rank)")
+    print(f"  Feature Schema  : {len(active_feature_cols)} features ({'18 features (16 baseline + JW + addr_both_present)' if feature_mode == '18' else '16 features (15 baseline + candidate_rank)'})")
+    print(f"  Address Dropout : {dropout_rate:.2f}")
+    if fallback_threshold is not None:
+        print(f"  Fallback Thresh : {fallback_threshold:.2f} (Name Gate: {args.name_threshold:.2f})")
 
     # Verify existing test candidates
     test_cands_path = resolve_test_candidate_file(output_dir)
@@ -198,11 +229,11 @@ def run_experiment(args):
     val_split_path = os.path.join(output_dir, "val_gt_split.tsv")
     train_cands_path = os.path.join(output_dir, "full_train_candidate_pairs.tsv")
     db_path = os.path.join(output_dir, "train_catalog_temp.db")
-    train_features_path = os.path.join(output_dir, "full_train_features_v3.csv")
-    val_features_path = os.path.join(output_dir, "full_val_features_v3.csv")
-    lgb_model_path = os.path.join(output_dir, "lgbm_model_v3.txt")
-    threshold_config_path = os.path.join(output_dir, "threshold_config_v3.json")
-    out_matching_path = os.path.join(output_dir, "matching_results.tsv")
+    train_features_path = os.path.join(output_dir, f"full_train_features_{exp_tag}.csv")
+    val_features_path = os.path.join(output_dir, f"full_val_features_{exp_tag}.csv")
+    lgb_model_path = os.path.join(output_dir, f"lgbm_model_{exp_tag}.txt")
+    threshold_config_path = os.path.join(output_dir, f"threshold_config_{exp_tag}.json")
+    out_matching_path = os.path.join(output_dir, out_matching_filename)
 
     # If blocking is needed and CUDA is not available, fail clearly
     needs_blocking = not (os.path.exists(train_cands_path) and os.path.getsize(train_cands_path) > 1024)
@@ -217,8 +248,12 @@ def run_experiment(args):
         print("  DRY-RUN SUMMARY: ALL PRE-CONDITIONS VERIFIED SUCCESSFULLY")
         print("=" * 75)
         print(f"  Experiment         : {args.experiment}")
+        print(f"  Feature Schema     : {len(active_feature_cols)} features (mode={feature_mode})")
+        print(f"  Address Dropout    : {dropout_rate:.2f}")
+        print(f"  Conditional Infer  : {'Enabled (Fallback: ' + str(fallback_threshold) + ', Name Gate: ' + str(args.name_threshold) + ')' if fallback_threshold is not None else 'Disabled (Standard Fixed Threshold)'}")
         print(f"  Dataset Root       : {data_root}")
         print(f"  Output Root        : {output_dir}")
+        print(f"  Model Artifact Tag : {exp_tag}")
         print(f"  Cache Directory    : {cache_dir} ({'in /tmp (zero /kaggle/working footprint)' if '/tmp' in cache_dir else 'in output root'})")
         print(f"  Cache Auto-Cleanup : {'Disabled (--keep-cache set)' if args.keep_cache else 'Enabled (purged post-Stage 3 to conserve disk)'}")
         print(f"  Working Footprint  : Expected peak ~14.6 GB (strictly within Kaggle 20 GB quota)")
@@ -226,8 +261,8 @@ def run_experiment(args):
         print(f"  Test Candidates    : Reusing {test_cands_path}")
         print(f"  Train Candidates   : {'Already present' if not needs_blocking else 'Will generate via GPU blocking (k=100)'}")
         print(f"  Train SQLite DB    : {'Already present' if os.path.exists(db_path) else 'Will build via SQLite'}")
-        print(f"  Feature Generation : {'Already present' if os.path.exists(train_features_path) else 'Will generate 16 features'}")
-        print(f"  Model Training     : {'Already present' if os.path.exists(lgb_model_path) else 'Will train 800-tree LightGBM'}")
+        print(f"  Feature Generation : {'Already present' if os.path.exists(train_features_path) else f'Will generate {len(active_feature_cols)} features ({train_features_path})'}")
+        print(f"  Model Training     : {'Already present' if os.path.exists(lgb_model_path) else f'Will train LightGBM booster ({lgb_model_path})'}")
         print(f"  Inference Target   : {out_matching_path}")
         print("Dry run completed cleanly. No heavy computations performed.")
         return 0
@@ -281,38 +316,42 @@ def run_experiment(args):
     )
 
     # -------------------------------------------------------------
-    # STAGE 5: Generate 16-Feature Datasets
+    # STAGE 5: Generate Feature Datasets
     # -------------------------------------------------------------
-    print("\n[STAGE 5/10] Feature Engineering (16 Features: 15 Baseline + Candidate Rank)...")
+    print(f"\n[STAGE 5/10] Feature Engineering ({len(active_feature_cols)} Features: mode={feature_mode})...")
     if os.path.exists(train_features_path) and os.path.exists(val_features_path) and os.path.getsize(train_features_path) > 1024:
         print(f"  Reusing existing feature datasets at:")
         print(f"    Train: {train_features_path} ({os.path.getsize(train_features_path)/(1024**2):.1f} MB)")
         print(f"    Val  : {val_features_path} ({os.path.getsize(val_features_path)/(1024**2):.1f} MB)")
     else:
         check_disk_space(output_dir, required_gb=6.0, stage_name="Stage 5 Feature Datasets")
-        print("  Extracting 16 features across training and undownsampled validation sets...")
+        print(f"  Extracting {len(active_feature_cols)} features across training and undownsampled validation sets...")
         build_v3_feature_datasets(
             cands_path=train_cands_path,
             val_split_path=val_split_path,
             out_train_path=train_features_path,
             out_val_path=val_features_path,
             resume=True,
-            db_path=db_path
+            db_path=db_path,
+            feature_mode=feature_mode
         )
 
     # -------------------------------------------------------------
     # STAGE 6 & 7: Model Training & Threshold Calibration
     # -------------------------------------------------------------
-    print("\n[STAGE 6 & 7/10] Training 16-Feature LightGBM & Threshold Calibration...")
+    print(f"\n[STAGE 6 & 7/10] Training LightGBM Booster ({len(active_feature_cols)} Features, Dropout={dropout_rate:.2f}) & Calibration...")
     if os.path.exists(lgb_model_path) and os.path.exists(threshold_config_path):
         print(f"  Reusing existing trained model and threshold config at: {threshold_config_path}")
     else:
-        print("  Training LightGBM booster (800 trees) on 16 features...")
+        print(f"  Training LightGBM booster on {len(active_feature_cols)} features with address_dropout={dropout_rate:.2f}...")
         train_and_evaluate(
             train_csv=train_features_path,
             val_csv=val_features_path,
             val_gt_path=val_split_path,
-            out_dir=output_dir
+            out_dir=output_dir,
+            address_dropout=dropout_rate,
+            feature_cols=active_feature_cols,
+            model_tag=exp_tag
         )
 
     with open(threshold_config_path, 'r', encoding='utf-8') as f:
@@ -335,7 +374,11 @@ def run_experiment(args):
         s2_path=test_files["s2"],
         s3_path=test_files["s3"],
         out_dir=output_dir,
-        out_matching_path=out_matching_path
+        out_matching_path=out_matching_path,
+        fallback_threshold=fallback_threshold,
+        name_threshold=args.name_threshold,
+        config_path=threshold_config_path,
+        lgb_path=lgb_model_path
     )
 
     # -------------------------------------------------------------
@@ -360,19 +403,44 @@ def run_experiment(args):
     validator_passed = (val_proc.returncode == 0)
 
     # -------------------------------------------------------------
-    # Final Execution Summary
+    # Final Execution Summary & Tracking
     # -------------------------------------------------------------
+    total_elapsed = time.time() - t_run_start
     print("\n" + "=" * 75)
-    print("  EXPERIMENT 002A EXECUTION SUMMARY")
+    print(f"  EXPERIMENT {args.experiment.upper()} EXECUTION SUMMARY")
     print("=" * 75)
-    print(f"  Experiment Name        : {args.experiment} (15 Baseline Features + Candidate Rank)")
+    print(f"  Experiment Name        : {args.experiment}")
+    print(f"  Feature Count          : {len(active_feature_cols)} (mode={feature_mode})")
+    print(f"  Address Dropout Rate   : {dropout_rate:.2f}")
     print(f"  Validation Macro F0.5  : {val_macro_f05:.5f}")
     print(f"  Selected Threshold     : {optimal_threshold}")
+    print(f"  Fallback Threshold     : {fallback_threshold}")
     print(f"  Singleton Cutoff       : {singleton_cutoff}")
     print(f"  Candidate Pair Path    : {test_cands_path}")
     print(f"  Matching Results TSV   : {out_matching_path}")
+    print(f"  Total Runtime          : {total_elapsed:.1f}s")
     print(f"  Validator Result       : {'PASS (Safe for Submission)' if validator_passed else 'FAIL'}")
     print("=" * 75)
+
+    # Record experiment metrics to output/experiment_results.json and output/experiment_results.tsv
+    try:
+        record_experiment_result(
+            output_dir=output_dir,
+            experiment_id=args.experiment,
+            feature_list=active_feature_cols,
+            threshold=optimal_threshold,
+            fallback_threshold=fallback_threshold,
+            name_threshold=args.name_threshold if fallback_threshold is not None else None,
+            address_dropout=dropout_rate,
+            candidate_count=0,
+            num_s1_entities=0,
+            num_predicted_matches=0,
+            val_f05=val_macro_f05,
+            runtime_seconds=total_elapsed,
+            notes=f"Experiment runner {args.experiment} execution"
+        )
+    except Exception as e:
+        print(f"  [Experiment Tracker Notice] Could not log experiment record: {e}")
 
     if not validator_passed:
         sys.exit(1)
@@ -381,13 +449,17 @@ def run_experiment(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Amazon ML Challenge 2026 Kaggle Runner")
-    parser.add_argument("--experiment", default="002a", choices=["002a", "002", "baseline"], help="Experiment identifier")
+    parser.add_argument("--experiment", default="002a", choices=["002a", "002", "003", "004", "005", "006", "007", "008", "baseline"], help="Experiment identifier (default: 002a)")
     parser.add_argument("--data-root", default=None, help="Root directory containing dataset (with train/ and test/ folders)")
     parser.add_argument("--output-root", default=None, help="Directory to store outputs and intermediate artifacts")
     parser.add_argument("--cache-dir", default=None, help="Directory for temporary dense embedding cache (defaults to /tmp/embeddings_cache if /tmp exists)")
     parser.add_argument("--keep-cache", action="store_true", help="Preserve temporary embedding cache after Stage 3 (default: False, purges cache to conserve disk)")
     parser.add_argument("--dry-run", action="store_true", help="Perform pre-flight checks and validate paths without heavy execution")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow running blocking on CPU (not recommended)")
+    parser.add_argument("--address-dropout", type=float, default=0.0, help="Training address dropout rate: 0.00, 0.05, 0.10, 0.15 (Exp 004 & Exp 008)")
+    parser.add_argument("--fallback-threshold", type=float, default=None, help="Conditional inference fallback threshold for missing-address cases (Exp 003 & Exp 008)")
+    parser.add_argument("--name-threshold", type=float, default=0.90, help="Name similarity gate for conditional fallback inference (default: 0.90)")
+    parser.add_argument("--max-block-size", type=int, default=50, help="Maximum candidates per blocking key (Exp 005 & Exp 006)")
     args = parser.parse_args()
 
     sys.exit(run_experiment(args))
