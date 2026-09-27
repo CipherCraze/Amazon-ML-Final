@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
 Amazon ML Challenge 2026 — Kaggle Runner Entry Point
-Experiment 002A: 15 Baseline Features + Candidate Rank (No Dense Cosine Sim)
+Experiment 010: Broad India Top-Up Retrieval + 19 Enriched Features + Consolidated XGBoost
 
-This runner automates the end-to-end execution of Experiment 002A on Kaggle
-or local GPU compute environments without requiring manual source-code,
-path, or constant modifications.
+End-to-end execution pipeline:
+  Stage 1: Environment & Path Pre-flight Validation
+  Stage 2: S1-Group-Safe Stratified Validation Split
+  Stage 3: Training Candidate Pool Verification / Generation (k=30)
+  Stage 4: India Top-Up Candidate Pool Augmentation (Training & Validation)
+  Stage 5: SQLite Catalog Preparation
+  Stage 6: Feature Extraction (19 Enriched Features)
+  Stage 7: Single Consolidated XGBoost Hist Booster Training & Threshold Calibration
+  Stage 8: India Top-Up Candidate Pool Augmentation (Test Set)
+  Stage 9: Test Inference on Augmented Candidate Pairs (with Reusable Raw Probabilities)
+  Stage 10: Official Submission Verification
 """
 
 import os
@@ -26,6 +34,7 @@ if REPO_ROOT not in sys.path:
 import torch
 from create_validation_split import create_splits
 from blocking import create_blocking
+from india_topup_retrieval import augment_candidate_pairs
 from feature_engineering import build_train_sqlite_catalog, build_v3_feature_datasets, FEATURE_COLS
 from train_model import train_and_evaluate
 from inference import run_test_inference
@@ -143,7 +152,7 @@ def check_disk_space(path, required_gb, stage_name):
 
 
 def resolve_test_candidate_file(output_dir):
-    """Finds existing test candidate pairs file. Reuses existing test candidates strictly."""
+    """Finds existing 002A test candidate pairs file. Reuses existing test candidates strictly."""
     candidates = [
         os.path.join(output_dir, "candidate_pairs.tsv"),
         os.path.join(REPO_ROOT, "output", "candidate_pairs.tsv"),
@@ -176,14 +185,14 @@ def run_experiment(args):
     print(f"  Dataset Root    : {data_root}")
     print(f"  Output Directory: {output_dir}")
     print(f"  Cache Directory : {cache_dir} ({'in /tmp (off /kaggle/working)' if '/tmp' in cache_dir else 'in output root'})")
-    print(f"  Feature Schema  : {len(FEATURE_COLS)} features (15 baseline + candidate_rank)")
+    print(f"  Feature Schema  : {len(FEATURE_COLS)} features: {FEATURE_COLS}")
 
-    # Verify existing test candidates
+    # Verify existing test candidates (Requirement 2: Preserve baseline)
     test_cands_path = resolve_test_candidate_file(output_dir)
     if not test_cands_path:
         raise FileNotFoundError(
             "CRITICAL: Required test candidate set (output/candidate_pairs.tsv) is missing!\n"
-            "For Experiment 002A, existing test candidates must be reused and NEVER regenerated.\n"
+            "Existing test candidates must be reused and NEVER overwritten or deleted.\n"
             "Please ensure output/candidate_pairs.tsv is present in the repository or output directory."
         )
 
@@ -197,12 +206,15 @@ def run_experiment(args):
     # Define stage output paths
     val_split_path = os.path.join(output_dir, "val_gt_split.tsv")
     train_cands_path = os.path.join(output_dir, "full_train_candidate_pairs.tsv")
+    augmented_train_cands_path = os.path.join(output_dir, "augmented_train_candidate_pairs.tsv")
     db_path = os.path.join(output_dir, "train_catalog_temp.db")
-    train_features_path = os.path.join(output_dir, "full_train_features_v3.csv")
-    val_features_path = os.path.join(output_dir, "full_val_features_v3.csv")
-    lgb_model_path = os.path.join(output_dir, "lgbm_model_v3.txt")
+    train_features_path = os.path.join(output_dir, "augmented_train_features.csv")
+    val_features_path = os.path.join(output_dir, "augmented_val_features.csv")
+    xgb_model_path = os.path.join(output_dir, "xgb_model_v3.json")
     threshold_config_path = os.path.join(output_dir, "threshold_config_v3.json")
-    out_matching_path = os.path.join(output_dir, "matching_results.tsv")
+    augmented_test_cands_path = os.path.join(output_dir, "augmented_candidate_pairs.tsv")
+    out_matching_path = os.path.join(output_dir, "augmented_matching_results.tsv")
+    raw_probs_path = os.path.join(output_dir, "test_candidate_probabilities.tsv")
 
     # If blocking is needed and CUDA is not available, fail clearly
     needs_blocking = not (os.path.exists(train_cands_path) and os.path.getsize(train_cands_path) > 1024)
@@ -216,42 +228,44 @@ def run_experiment(args):
         print("\n" + "=" * 75)
         print("  DRY-RUN SUMMARY: ALL PRE-CONDITIONS VERIFIED SUCCESSFULLY")
         print("=" * 75)
-        print(f"  Experiment         : {args.experiment}")
-        print(f"  Dataset Root       : {data_root}")
-        print(f"  Output Root        : {output_dir}")
-        print(f"  Cache Directory    : {cache_dir} ({'in /tmp (zero /kaggle/working footprint)' if '/tmp' in cache_dir else 'in output root'})")
-        print(f"  Cache Auto-Cleanup : {'Disabled (--keep-cache set)' if args.keep_cache else 'Enabled (purged post-Stage 3 to conserve disk)'}")
-        print(f"  Working Footprint  : Expected peak ~14.6 GB (strictly within Kaggle 20 GB quota)")
-        print(f"  CUDA Status        : {'Available (' + device_name + ')' if has_cuda else 'Unavailable'}")
-        print(f"  Test Candidates    : Reusing {test_cands_path}")
-        print(f"  Train Candidates   : {'Already present' if not needs_blocking else 'Will generate via GPU blocking (k=100)'}")
-        print(f"  Train SQLite DB    : {'Already present' if os.path.exists(db_path) else 'Will build via SQLite'}")
-        print(f"  Feature Generation : {'Already present' if os.path.exists(train_features_path) else 'Will generate 16 features'}")
-        print(f"  Model Training     : {'Already present' if os.path.exists(lgb_model_path) else 'Will train 800-tree LightGBM'}")
-        print(f"  Inference Target   : {out_matching_path}")
+        print(f"  Experiment             : {args.experiment} (India Top-Up + 19 Features + Consolidated XGBoost)")
+        print(f"  Dataset Root           : {data_root}")
+        print(f"  Output Root            : {output_dir}")
+        print(f"  Cache Directory        : {cache_dir} ({'in /tmp (zero /kaggle/working footprint)' if '/tmp' in cache_dir else 'in output root'})")
+        print(f"  Working Footprint      : Expected peak ~13.5 GB (strictly within Kaggle 20 GB quota)")
+        print(f"  CUDA Status            : {'Available (' + device_name + ')' if has_cuda else 'Unavailable'}")
+        print(f"  Test Candidates (Base) : Reusing {test_cands_path}")
+        print(f"  Train Candidates (Base): {'Already present' if not needs_blocking else 'Will generate via GPU blocking (k=30)'}")
+        print(f"  India Top-Up (Train)   : Will generate {augmented_train_cands_path}")
+        print(f"  Train SQLite DB        : {'Already present' if os.path.exists(db_path) else 'Will build via SQLite'}")
+        print(f"  Feature Generation     : {'Already present' if os.path.exists(train_features_path) else 'Will generate 19 features'}")
+        print(f"  Model Training         : {'Already present' if os.path.exists(xgb_model_path) else 'Will train 800-tree XGBoost Hist Booster'}")
+        print(f"  India Top-Up (Test)    : Will generate {augmented_test_cands_path}")
+        print(f"  Inference Target       : {out_matching_path}")
+        print(f"  Reusable Raw Probs     : {raw_probs_path}")
         print("Dry run completed cleanly. No heavy computations performed.")
         return 0
 
     # -------------------------------------------------------------
     # STAGE 2: Create Stratified Validation Split
     # -------------------------------------------------------------
-    print("\n[STAGE 2/10] Validation Split Preparation...")
+    print("\n[STAGE 2/10] S1-Group-Safe Validation Split Preparation...")
     if os.path.exists(val_split_path) and os.path.getsize(val_split_path) > 100:
         print(f"  Reusing existing validation split at: {val_split_path}")
     else:
-        print("  Generating 20% stratified validation split...")
+        print("  Generating 20% stratified validation split (strictly S1-group safe)...")
         create_splits(data_dir=os.path.dirname(train_files["gt"]), output_dir=output_dir)
 
     # -------------------------------------------------------------
-    # STAGE 3: Generate Training Candidate Pairs via GPU Blocking
+    # STAGE 3: Generate Base Training Candidate Pairs (k=30)
     # -------------------------------------------------------------
-    print("\n[STAGE 3/10] Training Candidate Generation (Blocking k=100)...")
+    print("\n[STAGE 3/10] Training Candidate Pool Preparation (Base k=30)...")
     if os.path.exists(train_cands_path) and os.path.getsize(train_cands_path) > 1024:
-        print(f"  Reusing existing training candidate pairs at: {train_cands_path} ({os.path.getsize(train_cands_path)/(1024**2):.1f} MB)")
+        print(f"  Reusing existing base training candidate pairs at: {train_cands_path} ({os.path.getsize(train_cands_path)/(1024**2):.1f} MB)")
     else:
         check_disk_space(cache_dir, required_gb=11.0, stage_name="Stage 3 Embedding Cache")
         check_disk_space(output_dir, required_gb=4.0, stage_name="Stage 3 Candidate Pairs Output")
-        print(f"  Generating training candidate pairs using dense semantic blocking (k=100)...")
+        print(f"  Generating base training candidate pairs using dense semantic blocking (k=30)...")
         print(f"  Temporary embedding cache location: {cache_dir}")
         create_blocking(
             val_s1_path=train_files["s1"],
@@ -259,19 +273,37 @@ def run_experiment(args):
             s3_path=train_files["s3"],
             output_path=train_cands_path,
             cache_dir=cache_dir,
-            k=100,
+            k=30,
             require_cuda=not args.allow_cpu
         )
         if not args.keep_cache and os.path.exists(cache_dir):
             print(f"  Cleaning up temporary embedding cache at {cache_dir} to free up disk space...")
             shutil.rmtree(cache_dir, ignore_errors=True)
-            print("  Temporary embedding cache successfully removed. (Stage 3 candidates safely preserved)")
+            print("  Temporary embedding cache successfully removed.")
 
     # -------------------------------------------------------------
-    # STAGE 4: Build SQLite Train Catalog
+    # STAGE 4: India Top-Up Augmentation on Training Candidate Pool
     # -------------------------------------------------------------
-    print("\n[STAGE 4/10] Building / Verifying SQLite Training Catalog...")
-    check_disk_space(output_dir, required_gb=3.5, stage_name="Stage 4 SQLite Catalog")
+    print("\n[STAGE 4/10] Augmenting Training Candidate Pool via India Top-Up...")
+    if os.path.exists(augmented_train_cands_path) and os.path.getsize(augmented_train_cands_path) > 1024:
+        print(f"  Reusing existing augmented training candidate pairs at: {augmented_train_cands_path} ({os.path.getsize(augmented_train_cands_path)/(1024**2):.1f} MB)")
+    else:
+        check_disk_space(output_dir, required_gb=3.0, stage_name="Stage 4 Augmented Training Candidates")
+        augment_candidate_pairs(
+            s1_path=train_files["s1"],
+            s2_path=train_files["s2"],
+            s3_path=train_files["s3"],
+            input_cands_path=train_cands_path,
+            output_cands_path=augmented_train_cands_path,
+            max_add_per_query=6,
+            max_block_size=25
+        )
+
+    # -------------------------------------------------------------
+    # STAGE 5: Build / Verify SQLite Train Catalog
+    # -------------------------------------------------------------
+    print("\n[STAGE 5/10] Building / Verifying SQLite Training Catalog...")
+    check_disk_space(output_dir, required_gb=3.5, stage_name="Stage 5 SQLite Catalog")
     build_train_sqlite_catalog(
         s1_path=train_files["s1"],
         s2_path=train_files["s2"],
@@ -281,18 +313,18 @@ def run_experiment(args):
     )
 
     # -------------------------------------------------------------
-    # STAGE 5: Generate 16-Feature Datasets
+    # STAGE 6: Generate 19-Feature Datasets
     # -------------------------------------------------------------
-    print("\n[STAGE 5/10] Feature Engineering (16 Features: 15 Baseline + Candidate Rank)...")
+    print(f"\n[STAGE 6/10] Feature Engineering ({len(FEATURE_COLS)} Features: Baseline + Rank + Cosine + Translit + Postal)...")
     if os.path.exists(train_features_path) and os.path.exists(val_features_path) and os.path.getsize(train_features_path) > 1024:
         print(f"  Reusing existing feature datasets at:")
         print(f"    Train: {train_features_path} ({os.path.getsize(train_features_path)/(1024**2):.1f} MB)")
         print(f"    Val  : {val_features_path} ({os.path.getsize(val_features_path)/(1024**2):.1f} MB)")
     else:
-        check_disk_space(output_dir, required_gb=6.0, stage_name="Stage 5 Feature Datasets")
-        print("  Extracting 16 features across training and undownsampled validation sets...")
+        check_disk_space(output_dir, required_gb=5.0, stage_name="Stage 6 Feature Datasets")
+        print("  Extracting 19 features across augmented training and undownsampled validation sets...")
         build_v3_feature_datasets(
-            cands_path=train_cands_path,
+            cands_path=augmented_train_cands_path,
             val_split_path=val_split_path,
             out_train_path=train_features_path,
             out_val_path=val_features_path,
@@ -301,13 +333,13 @@ def run_experiment(args):
         )
 
     # -------------------------------------------------------------
-    # STAGE 6 & 7: Model Training & Threshold Calibration
+    # STAGE 7: Consolidated XGBoost Training & Threshold Calibration
     # -------------------------------------------------------------
-    print("\n[STAGE 6 & 7/10] Training 16-Feature LightGBM & Threshold Calibration...")
-    if os.path.exists(lgb_model_path) and os.path.exists(threshold_config_path):
+    print("\n[STAGE 7/10] Training Consolidated XGBoost Model & Calibrating Thresholds...")
+    if os.path.exists(xgb_model_path) and os.path.exists(threshold_config_path):
         print(f"  Reusing existing trained model and threshold config at: {threshold_config_path}")
     else:
-        print("  Training LightGBM booster (800 trees) on 16 features...")
+        print("  Training XGBoost Hist Booster (800 trees) on augmented candidate distribution...")
         train_and_evaluate(
             train_csv=train_features_path,
             val_csv=val_features_path,
@@ -317,20 +349,48 @@ def run_experiment(args):
 
     with open(threshold_config_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
-    optimal_threshold = float(config.get("optimal_threshold", 0.64))
-    singleton_cutoff = float(config.get("singleton_cutoff", 0.75))
+    optimal_threshold = float(config.get("optimal_threshold", 0.63))
+    country_thresholds = config.get("country_thresholds", None)
+    singleton_cutoff = float(config.get("singleton_cutoff", 0.0))
     val_macro_f05 = float(config.get("validation_macro_f05", 0.0))
     print(f"  Calibrated Decision Threshold: {optimal_threshold}")
-    print(f"  Singleton Safeguard Cutoff   : {singleton_cutoff}")
+    if country_thresholds:
+        print(f"  Calibrated Country Thresholds: {country_thresholds}")
+    print(f"  Singleton Safeguard Cutoff   : {singleton_cutoff} ({'DISABLED' if singleton_cutoff <= 0.0 else 'ENABLED'})")
     print(f"  Validation Macro F0.5 Score  : {val_macro_f05:.5f}")
 
+    # Optional disk safeguard: Purge temporary SQLite catalog post-training if disk is low
+    usage = shutil.disk_usage(output_dir)
+    free_gb = usage.free / (1024**3)
+    if free_gb < 6.0 and os.path.exists(db_path):
+        print(f"  [Disk Safeguard] Low free space ({free_gb:.1f} GB). Purging temporary training SQLite DB {db_path}...")
+        os.remove(db_path)
+
     # -------------------------------------------------------------
-    # STAGE 8 & 9: Test Inference on Existing Candidate Pairs
+    # STAGE 8: India Top-Up Augmentation on Test Candidate Pool
     # -------------------------------------------------------------
-    print("\n[STAGE 8 & 9/10] Running Test Inference on Candidate Pairs...")
-    check_disk_space(output_dir, required_gb=3.0, stage_name="Stage 8 & 9 Test Inference")
+    print("\n[STAGE 8/10] Augmenting Test Candidate Pool via India Top-Up...")
+    if os.path.exists(augmented_test_cands_path) and os.path.getsize(augmented_test_cands_path) > 1024:
+        print(f"  Reusing existing augmented test candidate pairs at: {augmented_test_cands_path} ({os.path.getsize(augmented_test_cands_path)/(1024**2):.1f} MB)")
+    else:
+        check_disk_space(output_dir, required_gb=3.0, stage_name="Stage 8 Augmented Test Candidates")
+        augment_candidate_pairs(
+            s1_path=test_files["s1"],
+            s2_path=test_files["s2"],
+            s3_path=test_files["s3"],
+            input_cands_path=test_cands_path,
+            output_cands_path=augmented_test_cands_path,
+            max_add_per_query=6,
+            max_block_size=25
+        )
+
+    # -------------------------------------------------------------
+    # STAGE 9: Test Inference on Augmented Candidate Pairs
+    # -------------------------------------------------------------
+    print("\n[STAGE 9/10] Running Test Inference on Augmented Candidate Pairs...")
+    check_disk_space(output_dir, required_gb=3.0, stage_name="Stage 9 Test Inference")
     run_test_inference(
-        cands_path=test_cands_path,
+        cands_path=augmented_test_cands_path,
         s1_path=test_files["s1"],
         s2_path=test_files["s2"],
         s3_path=test_files["s3"],
@@ -349,7 +409,7 @@ def run_experiment(args):
     val_cmd = [
         sys.executable, validator_script,
         "--matching", out_matching_path,
-        "--candidate", test_cands_path,
+        "--candidate", augmented_test_cands_path,
         "--test-dir", test_files["test_dir"]
     ]
     val_proc = subprocess.run(val_cmd, capture_output=True, text=True)
@@ -363,14 +423,18 @@ def run_experiment(args):
     # Final Execution Summary
     # -------------------------------------------------------------
     print("\n" + "=" * 75)
-    print("  EXPERIMENT 002A EXECUTION SUMMARY")
+    print("  EXPERIMENT 010 (INDIA TOP-UP FINAL) EXECUTION SUMMARY")
     print("=" * 75)
-    print(f"  Experiment Name        : {args.experiment} (15 Baseline Features + Candidate Rank)")
+    print(f"  Experiment Name        : {args.experiment.upper()} (India Top-Up + 19 Features + Consolidated XGBoost)")
     print(f"  Validation Macro F0.5  : {val_macro_f05:.5f}")
-    print(f"  Selected Threshold     : {optimal_threshold}")
-    print(f"  Singleton Cutoff       : {singleton_cutoff}")
-    print(f"  Candidate Pair Path    : {test_cands_path}")
-    print(f"  Matching Results TSV   : {out_matching_path}")
+    print(f"  Decision Threshold     : {optimal_threshold}")
+    if country_thresholds:
+        print(f"  Country Thresholds     : {country_thresholds}")
+    print(f"  Singleton Safeguard    : DISABLED (0.0)")
+    print(f"  Base Test Candidates   : {test_cands_path} (PRESERVED)")
+    print(f"  Augmented Candidates   : {augmented_test_cands_path}")
+    print(f"  Augmented Matching TSV : {out_matching_path}")
+    print(f"  Reusable Probabilities : {raw_probs_path}")
     print(f"  Validator Result       : {'PASS (Safe for Submission)' if validator_passed else 'FAIL'}")
     print("=" * 75)
 
@@ -380,12 +444,12 @@ def run_experiment(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Amazon ML Challenge 2026 Kaggle Runner")
-    parser.add_argument("--experiment", default="002a", choices=["002a", "002", "baseline"], help="Experiment identifier")
+    parser = argparse.ArgumentParser(description="Amazon ML Challenge 2026 Kaggle Runner (Experiment 010)")
+    parser.add_argument("--experiment", default="010-india-topup-final", help="Experiment identifier")
     parser.add_argument("--data-root", default=None, help="Root directory containing dataset (with train/ and test/ folders)")
     parser.add_argument("--output-root", default=None, help="Directory to store outputs and intermediate artifacts")
-    parser.add_argument("--cache-dir", default=None, help="Directory for temporary dense embedding cache (defaults to /tmp/embeddings_cache if /tmp exists)")
-    parser.add_argument("--keep-cache", action="store_true", help="Preserve temporary embedding cache after Stage 3 (default: False, purges cache to conserve disk)")
+    parser.add_argument("--cache-dir", default=None, help="Directory for temporary dense embedding cache")
+    parser.add_argument("--keep-cache", action="store_true", help="Preserve temporary embedding cache after Stage 3")
     parser.add_argument("--dry-run", action="store_true", help="Perform pre-flight checks and validate paths without heavy execution")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow running blocking on CPU (not recommended)")
     args = parser.parse_args()

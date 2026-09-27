@@ -13,7 +13,10 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 from rapidfuzz import fuzz
 
-from preprocess import normalize_text, get_compact_signature, get_acronym, decompose_address
+from preprocess import (
+    normalize_text, get_compact_signature, get_acronym, decompose_address,
+    compute_name_indic_translit_sim, compute_postal_match
+)
 
 FEATURE_COLS = [
     'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
@@ -21,9 +24,12 @@ FEATURE_COLS = [
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
     'is_dba_pattern', 'source_origin',
-    'candidate_rank'
+    'candidate_rank',
+    'dense_cosine_sim',
+    'name_indic_translit_sim',
+    'postal_match'
 ]
-assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS) == 19, f"Expected 19 features, got {len(FEATURE_COLS)}"
 
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
@@ -115,97 +121,22 @@ def get_worker_xgb(xgb_path):
     return _WORKER_XGB
 
 
-def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
-    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
-    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
+def fast_19_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
+    """
+    Computes full 19-feature vector for entity pair during inference:
+      1-15. Baseline lexical & address features
+      16.   candidate_rank (1..60)
+      17.   dense_cosine_sim (from recovered e5-small, default 0.0)
+      18.   name_indic_translit_sim (transliteration-aware Indic name similarity)
+      19.   postal_match (exact / prefix postal agreement)
+    """
+    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec[:9]
+    s1_raw_name = s1_rec[9] if len(s1_rec) > 9 else s1_name
+    s1_pc = s1_rec[10] if len(s1_rec) > 10 else ""
     
-    if s1_name and c_name:
-        name_ratio = fuzz.ratio(s1_name, c_name) / 100.0
-        name_token_sort = fuzz.token_sort_ratio(s1_name, c_name) / 100.0
-        name_token_set = fuzz.token_set_ratio(s1_name, c_name) / 100.0
-        name_partial = fuzz.partial_ratio(s1_name, c_name) / 100.0
-    else:
-        name_ratio = name_token_sort = name_token_set = name_partial = 0.0
-        
-    if s1_comp and c_comp and (s1_comp == c_comp or (len(s1_comp)>=6 and s1_comp in c_comp) or (len(c_comp)>=6 and c_comp in s1_comp)):
-        name_compact_match = 1.0
-    else:
-        name_compact_match = 0.0
-        
-    if (s1_acro and s1_acro == c_comp) or (c_acro and c_acro == s1_comp):
-        name_acronym_match = 1.0
-    else:
-        name_acronym_match = 0.0
-        
-    is_addr_missing = 1.0 if (not s1_addr or not c_addr) else 0.0
-    
-    if s1_num and c_num:
-        street_num_match = 1.0 if s1_num == c_num else 0.0
-    elif not s1_num and not c_num:
-        street_num_match = 0.5
-    else:
-        street_num_match = 0.5
-        
-    if s1_street and c_street:
-        street_name_sim = fuzz.ratio(s1_street, c_street) / 100.0
-    elif not s1_street and not c_street:
-        street_name_sim = 0.5
-    else:
-        street_name_sim = 0.0
-        
-    if s1_cs and c_cs:
-        city_state_sim = fuzz.token_set_ratio(s1_cs, c_cs) / 100.0
-    elif not s1_cs and not c_cs:
-        city_state_sim = 0.5
-    else:
-        city_state_sim = 0.0
-        
-    if s1_addr and c_addr:
-        addr_token_sort = fuzz.token_sort_ratio(s1_addr, c_addr) / 100.0
-    else:
-        addr_token_sort = 0.0
-        
-    if s1_d and c_d:
-        digits_match = 1.0 if s1_d == c_d else 0.0
-    elif not s1_d and not c_d:
-        digits_match = 1.0
-    else:
-        digits_match = 0.0
-        
-    # 13. country_match
-    country_match = 1.0 if (s1_country and c_country and s1_country == c_country) else 0.0
-    
-    # 14. is_dba_pattern
-    is_dba_pattern = 1.0 if (street_name_sim >= 0.85 and street_num_match == 1.0 and country_match == 1.0) else 0.0
-    
-    # 15. source_origin
-    source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
-    
-    # 16. candidate_rank (raw integer rank 1..30 as float32)
-    rank_val = float(rank_idx)
-    assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
-    
-    res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
-           is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-           country_match, is_dba_pattern, source_origin, rank_val)
-    assert len(res) == 16, f"Expected 16 features, got {len(res)}"
-    return res
-
-
-def fast_16_features(s1_rec, c_rec, cand_id, rank_idx=1):
-    """Computes the 16-feature vector (15 baseline + candidate_rank)."""
-    return fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)
-
-
-def fast_15_features(s1_rec, c_rec, cand_id):
-    """Backwards-compatible wrapper returning the first 15 features."""
-    return fast_16_features(s1_rec, c_rec, cand_id, 1)[:15]
-
-
-def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
-    """Full feature extraction function supporting 16 or 17 features."""
-    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
-    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
+    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec[:9]
+    c_raw_name = c_rec[9] if len(c_rec) > 9 else c_name
+    c_pc = c_rec[10] if len(c_rec) > 10 else ""
     
     # 1-4. Name similarities
     if s1_name and c_name:
@@ -278,15 +209,37 @@ def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
     # 15. source_origin
     source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
     
-    # 16. candidate_rank (raw integer rank 1..30 as float32)
+    # 16. candidate_rank (raw integer rank 1..60 as float32)
     rank_val = float(rank_idx)
-    assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
+    assert 1.0 <= rank_val <= 60.0, f"Candidate rank {rank_val} out of expected [1, 60] range"
+    
+    # 17. dense_cosine_sim
+    dense_val = float(dense_score) if dense_score is not None else 0.0
+    dense_val = max(0.0, min(1.0, dense_val))
+    
+    # 18. name_indic_translit_sim
+    name_indic_sim = compute_name_indic_translit_sim(s1_raw_name, c_raw_name)
+    
+    # 19. postal_match
+    postal_sim = compute_postal_match(s1_pc or s1_addr, c_pc or c_addr)
     
     res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
            is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-           country_match, is_dba_pattern, source_origin, rank_val)
-    assert len(res) == 16, f"Expected 16 features, got {len(res)}"
+           country_match, is_dba_pattern, source_origin, rank_val, dense_val, name_indic_sim, postal_sim)
+    assert len(res) == 19, f"Expected 19 features, got {len(res)}"
     return res
+
+
+def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
+    return fast_19_features(s1_rec, c_rec, cand_id, dense_score=dense_score, rank_idx=rank_idx)[:17]
+
+
+def fast_16_features(s1_rec, c_rec, cand_id, rank_idx=1):
+    return fast_19_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)[:16]
+
+
+def fast_15_features(s1_rec, c_rec, cand_id):
+    return fast_19_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1)[:15]
 
 
 _WORKER_CONN = None
@@ -329,15 +282,16 @@ def process_inference_chunk(args):
     """
     Worker process:
     1. Fetches candidate and query metadata from SQLite and pre-normalizes once.
-    2. Computes the 16 features (15 baseline + candidate_rank).
-    3. Runs inference via LightGBM, XGBoost, or Ensemble Blend.
-    4. Evaluates matches with calibrated threshold and singleton guard.
+    2. Computes the 19 features (15 baseline + candidate_rank + dense_cosine_sim + translit + postal).
+    3. Runs inference via XGBoost (or configured booster).
+    4. Evaluates matches with calibrated global or country-specific thresholds.
     5. Formats output TSV lines in strictly preserved query order.
+    6. Collects raw probabilities >= 0.35 for reusable offline policy tuning without re-inference.
     """
-    chunk_idx, chunk_records, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff = args
+    chunk_idx, chunk_records, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff, country_thresholds = args
     
     if not chunk_records:
-        return chunk_idx, "", 0, 0, 0
+        return chunk_idx, "", 0, 0, 0, ""
         
     try:
         s1_ids = [r[0] for r in chunk_records]
@@ -347,14 +301,16 @@ def process_inference_chunk(args):
         for record in chunk_records:
             s1_id = record[0]
             cands_str = record[1]
+            row_scores = record[2] if len(record) > 2 else None
                 
             if not cands_str or cands_str == 'nan':
                 continue
             cands = [c.strip() for c in cands_str.split(',') if c.strip()]
             for rank_idx, cid in enumerate(cands, start=1):
-                assert 1 <= rank_idx <= 30, f"Candidate rank {rank_idx} is out of expected [1, 30] range"
+                assert 1 <= rank_idx <= 60, f"Candidate rank {rank_idx} is out of expected [1, 60] range"
+                dense_score = float(row_scores[rank_idx - 1]) if (row_scores is not None and rank_idx <= len(row_scores)) else 0.0
                 needed_cand_ids.add(cid)
-                pairs_list.append((s1_id, cid, rank_idx))
+                pairs_list.append((s1_id, cid, rank_idx, dense_score))
                 
         conn = get_worker_conn(db_path)
         cur = conn.cursor()
@@ -369,7 +325,7 @@ def process_inference_chunk(args):
             c_acro = get_acronym(name)
             c_addr, s_num, s_name, c_cs, c_pc = decompose_address(addr)
             d_str = extract_digits(f"{n_name} {addr}")
-            s1_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
+            s1_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "", str(name) if pd.notna(name) else "", c_pc or "")
         del s1_rows
         
         # 2. Fetch candidate metadata & pre-normalize
@@ -383,22 +339,23 @@ def process_inference_chunk(args):
                 c_acro = get_acronym(name)
                 c_addr, s_num, s_name, c_cs, c_pc = decompose_address(addr)
                 d_str = extract_digits(f"{n_name} {addr}")
-                catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
+                catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "", str(name) if pd.notna(name) else "", c_pc or "")
             del cat_rows
         
-        # 3. Compute 16 features
+        # 3. Compute 19 features
         num_pairs = len(pairs_list)
-        empty_rec = ("", "", "", "", "", "", "", "", "")
+        empty_rec = ("", "", "", "", "", "", "", "", "", "", "")
+        raw_prob_lines = []
         
         if num_pairs > 0:
-            X_feats = np.empty((num_pairs, 16), dtype=np.float32)
+            X_feats = np.empty((num_pairs, 19), dtype=np.float32)
             
-            for i, (s1_id, cand_id, r_idx) in enumerate(pairs_list):
+            for i, (s1_id, cand_id, r_idx, dense_s) in enumerate(pairs_list):
                 s1_rec = s1_dict.get(s1_id, empty_rec)
                 c_rec = catalog_dict.get(cand_id, empty_rec)
-                f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
-                assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
-                for j in range(16):
+                f = fast_19_features(s1_rec, c_rec, cand_id, dense_score=dense_s, rank_idx=r_idx)
+                assert len(f) == 19, f"Feature vector length must be 19, got {len(f)}"
+                for j in range(19):
                     X_feats[i, j] = f[j]
                     
             # 4. Predict probabilities with chosen model architecture
@@ -412,31 +369,38 @@ def process_inference_chunk(args):
                 del dmat
                 
                 probs = 0.5 * probs_lgb + 0.5 * probs_xgb
-            elif model_mode == "xgboost":
+            elif model_mode == "lgbm":
+                bst_lgb = get_worker_lgb(lgb_path)
+                probs = bst_lgb.predict(X_feats)
+            else: # xgboost (default)
                 bst_xgb = get_worker_xgb(xgb_path)
                 dmat = xgb.DMatrix(X_feats, feature_names=FEATURE_COLS)
                 probs = bst_xgb.predict(dmat)
                 del dmat
-            else: # lgbm
-                bst_lgb = get_worker_lgb(lgb_path)
-                probs = bst_lgb.predict(X_feats)
                 
-            # 5. Group candidate probabilities by s1_id
+            # 5. Group candidate probabilities by s1_id & collect reusable raw probs
             preds_by_s1 = {}
-            for (s1_id, cand_id, _), p in zip(pairs_list, probs):
+            for (s1_id, cand_id, _, _), p in zip(pairs_list, probs):
+                p_val = float(p)
                 if s1_id not in preds_by_s1:
                     preds_by_s1[s1_id] = []
-                preds_by_s1[s1_id].append((cand_id, p))
+                preds_by_s1[s1_id].append((cand_id, p_val))
+                if p_val >= 0.35:
+                    raw_prob_lines.append(f"{s1_id}\t{cand_id}\t{p_val:.4f}\n")
                 
-            # 6. Apply threshold and singleton guard
+            # 6. Apply calibrated threshold and optional country thresholds
             matches_by_s1 = {}
             for s1_id, cand_probs in preds_by_s1.items():
-                max_p = max(p for _, p in cand_probs)
-                if max_p < singleton_cutoff:
-                    matches_by_s1[s1_id] = []
-                    continue
-                    
-                matched_cands = [cid for cid, p in cand_probs if p >= threshold]
+                s1_ctry = s1_dict.get(s1_id, empty_rec)[8]
+                thresh_to_use = country_thresholds.get(s1_ctry, threshold) if country_thresholds else threshold
+                
+                if singleton_cutoff > 0.0:
+                    max_p = max(p for _, p in cand_probs)
+                    if max_p < singleton_cutoff:
+                        matches_by_s1[s1_id] = []
+                        continue
+                        
+                matched_cands = [cid for cid, p in cand_probs if p >= thresh_to_use]
                 matches_by_s1[s1_id] = matched_cands
         else:
             matches_by_s1 = {}
@@ -456,12 +420,12 @@ def process_inference_chunk(args):
                 lines.append(f"{s1_id}\t\n")
                 chunk_singletons += 1
                 
-        return chunk_idx, "".join(lines), chunk_matches, chunk_singletons, len(chunk_records)
+        return chunk_idx, "".join(lines), chunk_matches, chunk_singletons, len(chunk_records), "".join(raw_prob_lines)
         
     except Exception as e:
         print(f"\n[Warning] Exception in chunk {chunk_idx}: {e}", flush=True)
         fallback_lines = [f"{s1_id}\t\n" for s1_id, _ in chunk_records]
-        return chunk_idx, "".join(fallback_lines), 0, len(chunk_records), len(chunk_records)
+        return chunk_idx, "".join(fallback_lines), 0, len(chunk_records), len(chunk_records), ""
 
 
 def tsv_chunk_generator(tsv_path, chunk_size, scores_mmap=None):
@@ -480,8 +444,11 @@ def tsv_chunk_generator(tsv_path, chunk_size, scores_mmap=None):
                 cands_str = line[idx+1:]
                 if scores_mmap is not None:
                     cands = [c.strip() for c in cands_str.split(',') if c.strip()]
-                    row_scores = scores_mmap[row_counter][:len(cands)]
-                    assert len(row_scores) == len(cands), f"Dense scores ({len(row_scores)}) != candidates ({len(cands)}) for {s1_id}"
+                    n_scores = scores_mmap.shape[1] if len(scores_mmap.shape) > 1 else 0
+                    avail = min(len(cands), n_scores)
+                    row_scores = list(scores_mmap[row_counter][:avail])
+                    if len(cands) > avail:
+                        row_scores.extend([0.0] * (len(cands) - avail))
                     batch.append((s1_id, cands_str, row_scores))
                 else:
                     batch.append((s1_id, cands_str))
@@ -494,7 +461,7 @@ def tsv_chunk_generator(tsv_path, chunk_size, scores_mmap=None):
             yield chunk_idx, batch
 
 
-def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path, scores_path=None):
+def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_matching_path=None, scores_path=None):
     log_memory("Inference Start")
     
     config_path = os.path.join(out_dir, "threshold_config_v3.json")
@@ -502,21 +469,25 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
     xgb_path = os.path.join(out_dir, "xgb_model_v3.json")
     
     # 1. Load optimal threshold and model mode
+    country_thresholds = None
     if os.path.exists(config_path):
         with open(config_path, 'r', encoding='utf-8') as f:
             cfg = json.load(f)
-            model_mode = cfg.get('model_mode', 'ensemble')
-            threshold = float(cfg.get('optimal_threshold', 0.80))
-            singleton_cutoff = float(cfg.get('singleton_cutoff', max(0.75, threshold - 0.05)))
+            model_mode = cfg.get('model_mode', 'xgboost')
+            threshold = float(cfg.get('optimal_threshold', 0.63))
+            country_thresholds = cfg.get('country_thresholds', None)
+            singleton_cutoff = float(cfg.get('singleton_cutoff', 0.0))
             print(f"Loaded tuned configuration:")
             print(f"  - Model Architecture: {model_mode.upper()}")
             print(f"  - Decision Threshold: {threshold}")
-            print(f"  - Singleton Safeguard Cutoff: {singleton_cutoff}")
+            if country_thresholds:
+                print(f"  - Country Thresholds: {country_thresholds}")
+            print(f"  - Singleton Safeguard Cutoff: {singleton_cutoff} ({'DISABLED' if singleton_cutoff <= 0.0 else 'ENABLED'})")
             print(f"  - Validation Macro F0.5: {cfg.get('validation_macro_f05', 0):.5f}")
     else:
-        model_mode = "lgbm"
-        threshold = 0.80
-        singleton_cutoff = 0.76
+        model_mode = "xgboost"
+        threshold = 0.63
+        singleton_cutoff = 0.0
         print(f"Config not found at {config_path}. Using fallback mode: {model_mode}, threshold: {threshold}")
         
     # Check for dense scores cache (best_scores.npy or candidate_dense_scores.npy)
@@ -537,11 +508,27 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
     if scores_mmap is None:
         print("No dense scores cache found. Defaulting dense_cosine_sim to 0.0.")
         
+    # Requirement 2 safeguard: Never overwrite baseline matching_results.tsv
+    if out_matching_path is None or os.path.abspath(out_matching_path) == os.path.abspath(os.path.join(out_dir, "matching_results.tsv")):
+        # If frozen 002A matching_results.tsv exists in repo, route to augmented_matching_results.tsv
+        baseline_file = os.path.join(out_dir, "matching_results.tsv")
+        if os.path.exists(baseline_file) and out_matching_path == baseline_file:
+            print(f"  [Safeguard] Preserving frozen 002A baseline at {baseline_file}.")
+            out_matching_path = os.path.join(out_dir, "augmented_matching_results.tsv")
+            print(f"  Target output directed to: {out_matching_path}")
+        elif out_matching_path is None:
+            out_matching_path = os.path.join(out_dir, "augmented_matching_results.tsv")
+            
+    raw_probs_path = os.path.join(out_dir, "test_candidate_probabilities.tsv")
+    print(f"  Raw candidate probabilities will be saved to: {raw_probs_path}")
+        
     db_path = os.path.join(os.path.dirname(out_matching_path), "test_catalog_temp.db")
     build_test_sqlite_catalog(s1_path, s2_path, s3_path, db_path)
     
     if os.path.exists(out_matching_path):
         os.remove(out_matching_path)
+    if os.path.exists(raw_probs_path):
+        os.remove(raw_probs_path)
         
     num_cores = min(6, os.cpu_count())
     chunk_size = 1500
@@ -560,8 +547,11 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
     next_chunk_to_write = 0
     pending_buffer = {}
     
-    with open(out_matching_path, 'w', encoding='utf-8', buffering=2*1024*1024) as f_out:
+    with open(out_matching_path, 'w', encoding='utf-8', buffering=2*1024*1024) as f_out, \
+         open(raw_probs_path, 'w', encoding='utf-8', buffering=2*1024*1024) as f_probs:
+         
         f_out.write("source1_entity_id\tmatched_entity_ids\n")
+        f_probs.write("source1_entity_id\tcandidate_entity_id\tprobability\n")
         
         with ProcessPoolExecutor(max_workers=num_cores, max_tasks_per_child=20) as executor:
             futures = set()
@@ -570,16 +560,18 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
                 nonlocal next_chunk_to_write, completed_queries, total_matches, total_singletons
                 done, remaining = wait(futures_set, return_when=FIRST_COMPLETED)
                 for fut in done:
-                    c_idx, tsv_text, c_matches, c_singletons, c_queries = fut.result()
-                    pending_buffer[c_idx] = tsv_text
+                    c_idx, tsv_text, c_matches, c_singletons, c_queries, raw_chunk = fut.result()
+                    pending_buffer[c_idx] = (tsv_text, raw_chunk)
                     total_matches += c_matches
                     total_singletons += c_singletons
                     completed_queries += c_queries
                     
                 while next_chunk_to_write in pending_buffer:
-                    chunk_text = pending_buffer.pop(next_chunk_to_write)
+                    chunk_text, chunk_raw = pending_buffer.pop(next_chunk_to_write)
                     if chunk_text:
                         f_out.write(chunk_text)
+                    if chunk_raw:
+                        f_probs.write(chunk_raw)
                     next_chunk_to_write += 1
                     
                 return remaining
@@ -596,7 +588,7 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
                     
                 futures.add(executor.submit(
                     process_inference_chunk,
-                    (c_idx, batch, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff)
+                    (c_idx, batch, db_path, model_mode, lgb_path, xgb_path, threshold, singleton_cutoff, country_thresholds)
                 ))
                 
                 if (c_idx + 1) % 50 == 0:
@@ -612,9 +604,11 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
                 futures = harvest_and_write(futures)
                 
             while next_chunk_to_write in pending_buffer:
-                chunk_text = pending_buffer.pop(next_chunk_to_write)
+                chunk_text, chunk_raw = pending_buffer.pop(next_chunk_to_write)
                 if chunk_text:
                     f_out.write(chunk_text)
+                if chunk_raw:
+                    f_probs.write(chunk_raw)
                 next_chunk_to_write += 1
 
     total_elapsed = time.time() - start_time
@@ -624,6 +618,7 @@ def run_test_inference(cands_path, s1_path, s2_path, s3_path, out_dir, out_match
     print(f"  Total matches predicted: {total_matches:,}")
     print(f"  Singletons (predicted empty): {total_singletons:,} ({total_singletons/max(completed_queries, 1)*100:.2f}%)")
     print(f"  Output saved to: {out_matching_path}")
+    print(f"  Reusable raw test probabilities saved to: {raw_probs_path}")
     print(f"{'='*65}")
 
 
@@ -632,7 +627,7 @@ if __name__ == "__main__":
     import multiprocessing as mp
     mp.freeze_support()
     
-    parser = argparse.ArgumentParser(description="Test Inference (16 features)")
+    parser = argparse.ArgumentParser(description="Test Inference (19 features)")
     parser.add_argument("--cands", default=None, help="Path to test candidate_pairs.tsv")
     parser.add_argument("--s1", default=None, help="Path to test_source1.tsv")
     parser.add_argument("--s2", default=None, help="Path to test_source2.tsv")
@@ -654,10 +649,18 @@ if __name__ == "__main__":
     s1_path = args.s1 or os.path.join(test_dir, "test_source1.tsv")
     s2_path = args.s2 or os.path.join(test_dir, "test_source2.tsv")
     s3_path = args.s3 or os.path.join(test_dir, "test_source3.tsv")
-    cands_path = args.cands or os.path.join(out_dir, "candidate_pairs.tsv")
-    out_matching_path = args.out_matching or os.path.join(out_dir, "matching_results.tsv")
+    
+    # Prefer augmented candidates if available
+    augmented_cands = os.path.join(out_dir, "augmented_candidate_pairs.tsv")
+    if os.path.exists(augmented_cands):
+        cands_path = args.cands or augmented_cands
+    else:
+        cands_path = args.cands or os.path.join(out_dir, "candidate_pairs.tsv")
+        
+    out_matching_path = args.out_matching or os.path.join(out_dir, "augmented_matching_results.tsv")
     
     run_test_inference(
         cands_path, s1_path, s2_path, s3_path, 
         out_dir, out_matching_path
     )
+

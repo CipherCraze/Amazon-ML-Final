@@ -237,3 +237,42 @@ def preprocess_dataframe(df):
     df['norm_address'] = address_features.apply(lambda x: x[0])
     df['postal_code'] = address_features.apply(lambda x: x[1])
     return df
+
+postal_extract_re = re.compile(r'\b[1-9][0-9]{4,5}\b')
+
+def compute_name_indic_translit_sim(s1_name, c_name):
+    """
+    Transliteration-aware name similarity:
+    Converts native Indic script to Latin phonetics before computing token-set similarity.
+    Fixes retrieval/ranking failure on Indic names.
+    """
+    if not s1_name or not c_name:
+        return 0.0
+    s1_str = str(s1_name)
+    c_str = str(c_name)
+    s1_t = unidecode.unidecode(s1_str).lower() if (unidecode is not None and any(ord(c) > 127 for c in s1_str)) else s1_str.lower()
+    c_t = unidecode.unidecode(c_str).lower() if (unidecode is not None and any(ord(c) > 127 for c in c_str)) else c_str.lower()
+    from rapidfuzz import fuzz
+    return fuzz.token_set_ratio(s1_t, c_t) / 100.0
+
+def compute_postal_match(s1_addr, c_addr):
+    """
+    Evaluates spatial agreement via postal / PIN codes:
+      1.0 = exact postal code match
+      0.5 = 3-digit prefix match (same postal zone/district)
+      0.0 = conflicting postal codes
+      0.2 = missing postal code in either entity
+    """
+    if not s1_addr or not c_addr:
+        return 0.2
+    s1_p = postal_extract_re.findall(str(s1_addr))
+    c_p = postal_extract_re.findall(str(c_addr))
+    if not s1_p or not c_p:
+        return 0.2
+    p1, p2 = s1_p[0], c_p[0]
+    if p1 == p2:
+        return 1.0
+    if len(p1) == len(p2) and p1[:3] == p2[:3]:
+        return 0.5
+    return 0.0
+

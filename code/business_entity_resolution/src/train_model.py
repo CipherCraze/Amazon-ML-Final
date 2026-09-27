@@ -9,15 +9,20 @@ import lightgbm as lgb
 import xgboost as xgb
 from tqdm import tqdm
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
 FEATURE_COLS = [
     'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
     'name_compact_match', 'name_acronym_match', 'is_addr_missing',
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
     'is_dba_pattern', 'source_origin',
-    'candidate_rank'
+    'candidate_rank',
+    'dense_cosine_sim',
+    'name_indic_translit_sim',
+    'postal_match'
 ]
-assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS) == 19, f"Expected 19 features, got {len(FEATURE_COLS)}"
 
 COL_DTYPES = {
     'name_ratio': np.float32,
@@ -36,6 +41,9 @@ COL_DTYPES = {
     'is_dba_pattern': np.float32,
     'source_origin': np.float32,
     'candidate_rank': np.float32,
+    'dense_cosine_sim': np.float32,
+    'name_indic_translit_sim': np.float32,
+    'postal_match': np.float32,
     'source1_entity_id': 'str',
     'candidate_entity_id': 'str',
     'label': np.int8
@@ -65,11 +73,12 @@ def compute_f05_single(pred_set, true_set):
     return (1.25 * precision * recall) / (0.25 * precision + recall)
 
 
-def scan_optimal_threshold(val_csv_path, val_probs, val_gt_path, model_label="Model"):
+def scan_optimal_threshold(val_csv_path, val_probs, val_gt_path, s1_country_map=None, model_label="Model"):
     """
     Scans probability thresholds from 0.50 to 0.98 with exact macro-averaged F0.5
     over all entities in the validation set, including true singletons.
-    Streams val_csv to preserve memory.
+    If s1_country_map is provided, also optimizes country-specific thresholds (US, India, France)
+    and validates whether country-aware thresholds beat the global threshold.
     """
     print(f"\n--- EXACT MACRO-AVERAGED F0.5 THRESHOLD SCANNING ({model_label.upper()}) ---")
     log_memory(f"Threshold Scan {model_label}")
@@ -113,12 +122,13 @@ def scan_optimal_threshold(val_csv_path, val_probs, val_gt_path, model_label="Mo
     
     best_threshold = 0.50
     best_macro_f05 = -1.0
-    thresholds = np.arange(0.50, 0.98, 0.01)
-    results = []
+    thresholds = np.arange(0.50, 0.96, 0.01)
     
-    print(f"Scanning decision thresholds for {model_label} (Total candidates >= 0.40: {sum(len(v) for v in cand_by_s1.values()):,})...")
+    print(f"Scanning global decision thresholds for {model_label} (Candidates >= 0.40: {sum(len(v) for v in cand_by_s1.values()):,})...")
     print(f"{'Threshold':>10} | {'Macro F0.5':>12} | {'Entities w/ Preds':>18} | {'Singletons Kept':>16}")
     print("-" * 65)
+    
+    singletons_no_cands = len(singleton_entities - set(cand_by_s1.keys()))
     
     for t in thresholds:
         t_val = round(float(t), 2)
@@ -138,24 +148,81 @@ def scan_optimal_threshold(val_csv_path, val_probs, val_gt_path, model_label="Mo
                     score_sum += 1.0
                     singletons_survived += 1
                     
-        singletons_no_cands = len(singleton_entities - set(cand_by_s1.keys()))
         score_sum += singletons_no_cands
         singletons_survived += singletons_no_cands
         
         macro_f05 = score_sum / total_val_entities
-        results.append((t_val, macro_f05, entities_with_preds, singletons_survived))
         
         if macro_f05 > best_macro_f05:
             best_macro_f05 = macro_f05
             best_threshold = t_val
             
-        if int(round(t_val * 100)) % 5 == 0 or t_val in [0.60, 0.68, 0.75, 0.80, 0.85, 0.90]:
+        if int(round(t_val * 100)) % 5 == 0 or t_val in [0.60, 0.63, 0.65, 0.70, 0.75, 0.80]:
             marker = "  <<< MAX" if t_val == best_threshold else ""
             print(f"{t_val:>10.2f} | {macro_f05:>12.5f} | {entities_with_preds:>18,} | {singletons_survived:>16,}{marker}")
             
     print("-" * 65)
-    print(f"\n>>> [{model_label.upper()}] OPTIMAL THRESHOLD: {best_threshold:.2f} with Macro F0.5 = {best_macro_f05:.5f} <<<")
-    return best_threshold, best_macro_f05, results
+    print(f">>> GLOBAL OPTIMAL THRESHOLD: {best_threshold:.2f} with Macro F0.5 = {best_macro_f05:.5f} <<<")
+    
+    # Country-aware threshold optimization (if country mapping is available)
+    country_thresholds = None
+    if s1_country_map:
+        print("\nEvaluating country-specific threshold calibration...")
+        countries = set(s1_country_map.get(sid, 'UNKNOWN') for sid in all_s1_ids)
+        best_c_thresh = {}
+        
+        for ctry in countries:
+            ctry_sids = [sid for sid in all_s1_ids if s1_country_map.get(sid) == ctry]
+            ctry_total = len(ctry_sids)
+            if ctry_total == 0:
+                continue
+            ctry_singletons = set(sid for sid in ctry_sids if sid in singleton_entities)
+            ctry_no_cands = len(ctry_singletons - set(cand_by_s1.keys()))
+            
+            c_best_t = best_threshold
+            c_best_f = -1.0
+            
+            for t in thresholds:
+                t_val = round(float(t), 2)
+                c_sum = 0.0
+                for sid in ctry_sids:
+                    cands = cand_by_s1.get(sid, [])
+                    pred_set = set(cid for cid, p in cands if p >= t_val)
+                    if pred_set:
+                        true_set = gt_map.get(sid, set())
+                        c_sum += compute_f05_single(pred_set, true_set)
+                    elif sid in singleton_entities:
+                        c_sum += 1.0
+                c_f05 = c_sum / ctry_total
+                if c_f05 > c_best_f:
+                    c_best_f = c_f05
+                    c_best_t = t_val
+            best_c_thresh[ctry] = (c_best_t, c_best_f)
+            print(f"  Country [{ctry:6s}]: Best Threshold = {c_best_t:.2f} | Macro F0.5 = {c_best_f:.5f} (N={ctry_total:,})")
+            
+        # Re-evaluate combined Macro F0.5 using country-specific thresholds
+        combined_score = 0.0
+        for sid in all_s1_ids:
+            ctry = s1_country_map.get(sid, 'UNKNOWN')
+            t_use = best_c_thresh.get(ctry, (best_threshold, 0))[0]
+            cands = cand_by_s1.get(sid, [])
+            pred_set = set(cid for cid, p in cands if p >= t_use)
+            if pred_set:
+                combined_score += compute_f05_single(pred_set, gt_map.get(sid, set()))
+            elif sid in singleton_entities:
+                combined_score += 1.0
+        combined_macro_f05 = combined_score / total_val_entities
+        print(f"  Combined Country-Aware Macro F0.5: {combined_macro_f05:.5f} (vs Global: {best_macro_f05:.5f})")
+        
+        if combined_macro_f05 > best_macro_f05 + 0.0001:
+            print("  >>> Country-aware thresholds justified! Adopting country-specific thresholds. <<<")
+            country_thresholds = {k: v[0] for k, v in best_c_thresh.items()}
+            best_macro_f05 = combined_macro_f05
+        else:
+            print("  >>> Country-aware thresholds did not provide significant gain. Retaining global threshold. <<<")
+            country_thresholds = None
+            
+    return best_threshold, best_macro_f05, country_thresholds
 
 
 def load_dataset(csv_path, chunk_size=500000):
@@ -183,7 +250,7 @@ def load_dataset(csv_path, chunk_size=500000):
     return X, y
 
 
-def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
+def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir, train_lgb=False):
     log_memory("Pipeline Start")
     
     out_lgb_model = os.path.join(out_dir, "lgbm_model_v3.txt")
@@ -194,18 +261,19 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
     val_probs_xgb_path = os.path.join(out_dir, "val_probs_xgb_v3.npy")
     
     # -------------------------------------------------------------
-    # MODEL 1: High-Capacity LightGBM Booster
+    # MODEL 1: Optional LightGBM Booster (default: skipped for pure consolidated XGBoost)
     # -------------------------------------------------------------
-    if os.path.exists(out_lgb_model) and os.path.exists(val_probs_lgb_path):
-        print(f"\n[LightGBM] Found existing trained model ({out_lgb_model}) and predictions ({val_probs_lgb_path}). Loading...")
-        val_probs_lgb = np.load(val_probs_lgb_path)
-    else:
-        print("\n" + "="*60)
-        print("=== MODEL 1: Training High-Capacity LightGBM Booster (800 Trees) ===")
-        print("="*60)
-        print(f"\n=== Loading Training & Validation Data for LightGBM ===")
-        X_train, y_train = load_dataset(train_csv)
-        X_val, y_val = load_dataset(val_csv)
+    if train_lgb:
+        if os.path.exists(out_lgb_model) and os.path.exists(val_probs_lgb_path):
+            print(f"\n[LightGBM] Found existing trained model ({out_lgb_model}) and predictions ({val_probs_lgb_path}). Loading...")
+            val_probs_lgb = np.load(val_probs_lgb_path)
+        else:
+            print("\n" + "="*60)
+            print("=== MODEL 1: Training High-Capacity LightGBM Booster (800 Trees) ===")
+            print("="*60)
+            print(f"\n=== Loading Training & Validation Data for LightGBM ===")
+            X_train, y_train = load_dataset(train_csv)
+            X_val, y_val = load_dataset(val_csv)
         
         train_data_lgb = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_COLS, free_raw_data=True)
         val_data_lgb = lgb.Dataset(X_val, label=y_val, feature_name=FEATURE_COLS, reference=train_data_lgb, free_raw_data=False)
@@ -309,54 +377,56 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
         log_memory("After XGBoost Cleanup")
     
     # -------------------------------------------------------------
-    # EVALUATION & ENSEMBLE BLENDING
+    # EVALUATION & COUNTRY-AWARE THRESHOLD CALIBRATION
     # -------------------------------------------------------------
     print("\n" + "="*60)
-    print("=== 3. Evaluating Individual Models & Ensemble Blend ===")
+    print("=== 3. Evaluating XGBoost Model & Calibrating Thresholds ===")
     print("="*60)
     
-    # 1. Evaluate LightGBM alone
-    t_lgb, f05_lgb, _ = scan_optimal_threshold(val_csv, val_probs_lgb, val_gt_path, model_label="LightGBM")
+    # Try resolving s1_path for country mapping
+    s1_country_map = None
+    search_dirs = [
+        os.path.dirname(val_gt_path),
+        os.path.join(REPO_ROOT, "student_resource", "dataset", "train"),
+        os.path.join(REPO_ROOT, "dataset", "train"),
+        "/kaggle/input/amazon-ml-challenge-2026/dataset/train",
+        "/kaggle/input/dataset/train"
+    ]
+    for d in search_dirs:
+        if d and os.path.exists(d):
+            s1_file = os.path.join(d, "train_source1.tsv")
+            if os.path.exists(s1_file):
+                print(f"Loading country metadata for threshold calibration from: {s1_file}")
+                s1_c_df = pd.read_csv(s1_file, sep="\t", usecols=['entity_id', 'country'], dtype=str)
+                s1_country_map = dict(zip(s1_c_df['entity_id'], s1_c_df['country']))
+                del s1_c_df
+                break
+            
+    # Evaluate XGBoost
+    t_xgb, f05_xgb, country_thresholds = scan_optimal_threshold(
+        val_csv, val_probs_xgb, val_gt_path, 
+        s1_country_map=s1_country_map, 
+        model_label="XGBoost"
+    )
     
-    # 2. Evaluate XGBoost alone
-    t_xgb, f05_xgb, _ = scan_optimal_threshold(val_csv, val_probs_xgb, val_gt_path, model_label="XGBoost")
+    chosen_mode = "xgboost"
+    chosen_thresh = t_xgb
+    chosen_f05 = f05_xgb
     
-    # 3. Evaluate Ensemble Blend (50/50 blend)
-    val_probs_ens = 0.5 * val_probs_lgb + 0.5 * val_probs_xgb
-    t_ens, f05_ens, _ = scan_optimal_threshold(val_csv, val_probs_ens, val_gt_path, model_label="LightGBM+XGBoost Ensemble")
-    
-    print("\n" + "="*60)
-    print("=== FINAL MODEL COMPARISON ===")
-    print(f"  LightGBM Alone:             Macro F0.5 = {f05_lgb:.5f} (Threshold: {t_lgb:.2f})")
-    print(f"  XGBoost Alone:              Macro F0.5 = {f05_xgb:.5f} (Threshold: {t_xgb:.2f})")
-    print(f"  Ensemble (LGBM + XGBoost):  Macro F0.5 = {f05_ens:.5f} (Threshold: {t_ens:.2f})")
-    print("="*60)
-    
-    # Select winning model configuration
-    if f05_ens >= max(f05_lgb, f05_xgb):
-        chosen_mode = "ensemble"
-        chosen_thresh = t_ens
-        chosen_f05 = f05_ens
-    elif f05_xgb > f05_lgb:
-        chosen_mode = "xgboost"
-        chosen_thresh = t_xgb
-        chosen_f05 = f05_xgb
+    print(f"\n>>> Selected Winning Configuration: {chosen_mode.upper()} with Macro F0.5 = {chosen_f05:.5f} (Global Threshold: {chosen_thresh:.2f}) <<<")
+    if country_thresholds:
+        print(f"  Using Country-Specific Thresholds: {country_thresholds}")
     else:
-        chosen_mode = "lgbm"
-        chosen_thresh = t_lgb
-        chosen_f05 = f05_lgb
-        
-    print(f"\n>>> Selected Winning Configuration: {chosen_mode.upper()} with Macro F0.5 = {chosen_f05:.5f} (Threshold: {chosen_thresh:.2f}) <<<")
+        print("  Using Single Global Decision Threshold.")
+    print("  Singleton Safeguard Cutoff: DISABLED (0.0)")
     
-    singleton_cutoff = max(0.75, round(chosen_thresh - 0.04, 2))
     config = {
         "model_mode": chosen_mode,
         "optimal_threshold": chosen_thresh,
-        "singleton_cutoff": singleton_cutoff,
+        "country_thresholds": country_thresholds,
+        "singleton_cutoff": 0.0,
         "validation_macro_f05": chosen_f05,
-        "lgbm_score": f05_lgb,
         "xgb_score": f05_xgb,
-        "ensemble_score": f05_ens,
         "features": FEATURE_COLS,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -367,19 +437,20 @@ def train_and_evaluate(train_csv, val_csv, val_gt_path, out_dir):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Train LightGBM Model (16 features)")
+    parser = argparse.ArgumentParser(description="Train Consolidated XGBoost Model (19 features)")
     parser.add_argument("--out-dir", default=None, help="Output directory for model and config")
     parser.add_argument("--train-csv", default=None, help="Path to full_train_features_v3.csv")
     parser.add_argument("--val-csv", default=None, help="Path to full_val_features_v3.csv")
     parser.add_argument("--val-gt", default=None, help="Path to val_gt_split.tsv")
+    parser.add_argument("--train-lgb", action="store_true", help="Also train LightGBM booster (optional)")
     args = parser.parse_args()
 
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    repo_root = REPO_ROOT
     out_dir = args.out_dir or os.path.join(repo_root, "output")
     os.makedirs(out_dir, exist_ok=True)
     
-    train_csv = args.train_csv or os.path.join(out_dir, "full_train_features_v3.csv")
-    val_csv = args.val_csv or os.path.join(out_dir, "full_val_features_v3.csv")
+    train_csv = args.train_csv or os.path.join(out_dir, "augmented_train_features.csv")
+    val_csv = args.val_csv or os.path.join(out_dir, "augmented_val_features.csv")
     val_gt = args.val_gt or os.path.join(out_dir, "val_gt_split.tsv")
     
-    train_and_evaluate(train_csv, val_csv, val_gt, out_dir)
+    train_and_evaluate(train_csv, val_csv, val_gt, out_dir, train_lgb=args.train_lgb)

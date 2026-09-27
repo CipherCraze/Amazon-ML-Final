@@ -6,11 +6,15 @@ import time
 import psutil
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from rapidfuzz import fuzz
 
-from preprocess import normalize_text, get_compact_signature, get_acronym, decompose_address
+from preprocess import (
+    normalize_text, get_compact_signature, get_acronym, decompose_address,
+    compute_name_indic_translit_sim, compute_postal_match
+)
 
 FEATURE_COLS = [
     'name_ratio', 'name_token_sort', 'name_token_set', 'name_partial',
@@ -18,9 +22,12 @@ FEATURE_COLS = [
     'street_num_match', 'street_name_sim', 'city_state_sim',
     'addr_token_sort', 'digits_match', 'country_match',
     'is_dba_pattern', 'source_origin',
-    'candidate_rank'
+    'candidate_rank',
+    'dense_cosine_sim',
+    'name_indic_translit_sim',
+    'postal_match'
 ]
-assert len(FEATURE_COLS) == 16, f"Expected 16 features, got {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS) == 19, f"Expected 19 features, got {len(FEATURE_COLS)}"
 
 digits_re = re.compile(r'\d+')
 def extract_digits(text):
@@ -73,9 +80,22 @@ def fetch_gt_by_ids(cur, id_list, batch_size=900):
     return gt_map
 
 
-def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
-    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
-    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
+def fast_19_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
+    """
+    Computes full 19-feature vector for entity pair:
+      1-15. Baseline lexical & address features
+      16.   candidate_rank (1..60)
+      17.   dense_cosine_sim (from recovered e5-small, default 0.0)
+      18.   name_indic_translit_sim (transliteration-aware Indic name similarity)
+      19.   postal_match (exact / prefix postal agreement)
+    """
+    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec[:9]
+    s1_raw_name = s1_rec[9] if len(s1_rec) > 9 else s1_name
+    s1_pc = s1_rec[10] if len(s1_rec) > 10 else ""
+    
+    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec[:9]
+    c_raw_name = c_rec[9] if len(c_rec) > 9 else c_name
+    c_pc = c_rec[10] if len(c_rec) > 10 else ""
     
     # 1-4. Name similarities
     if s1_name and c_name:
@@ -148,112 +168,41 @@ def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
     # 15. source_origin
     source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
     
-    # 16. candidate_rank (raw integer rank 1..30 as float32)
+    # 16. candidate_rank (raw integer rank 1..60 as float32)
     rank_val = float(rank_idx)
-    assert 1.0 <= rank_val <= 30.0, f"Candidate rank {rank_val} out of expected [1, 30] range"
+    assert 1.0 <= rank_val <= 60.0, f"Candidate rank {rank_val} out of expected [1, 60] range"
+    
+    # 17. dense_cosine_sim
+    dense_val = float(dense_score) if dense_score is not None else 0.0
+    dense_val = max(0.0, min(1.0, dense_val))
+    
+    # 18. name_indic_translit_sim
+    name_indic_sim = compute_name_indic_translit_sim(s1_raw_name, c_raw_name)
+    
+    # 19. postal_match
+    postal_sim = compute_postal_match(s1_pc or s1_addr, c_pc or c_addr)
     
     res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
            is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-           country_match, is_dba_pattern, source_origin, rank_val)
-    assert len(res) == 16, f"Expected 16 features, got {len(res)}"
+           country_match, is_dba_pattern, source_origin, rank_val, dense_val, name_indic_sim, postal_sim)
+    assert len(res) == 19, f"Expected 19 features, got {len(res)}"
     return res
+
+
+def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
+    return fast_19_features(s1_rec, c_rec, cand_id, dense_score=dense_score, rank_idx=rank_idx)[:17]
 
 
 def fast_16_features(s1_rec, c_rec, cand_id, rank_idx=1):
     """Computes the 16-feature vector (15 baseline + candidate_rank)."""
-    return fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)
+    f19 = fast_19_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=rank_idx)
+    return f19[:16]
 
 
 def fast_15_features(s1_rec, c_rec, cand_id):
     """Backwards-compatible wrapper returning the first 15 features."""
-    return fast_16_features(s1_rec, c_rec, cand_id, 1)[:15]
+    return fast_19_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1)[:15]
 
-
-def fast_17_features(s1_rec, c_rec, cand_id, dense_score=0.0, rank_idx=1):
-    """Full feature extraction function supporting 16 or 17 features."""
-    s1_name, s1_comp, s1_acro, s1_addr, s1_num, s1_street, s1_cs, s1_d, s1_country = s1_rec
-    c_name, c_comp, c_acro, c_addr, c_num, c_street, c_cs, c_d, c_country = c_rec
-    
-    # 1-4. Name similarities
-    if s1_name and c_name:
-        name_ratio = fuzz.ratio(s1_name, c_name) / 100.0
-        name_token_sort = fuzz.token_sort_ratio(s1_name, c_name) / 100.0
-        name_token_set = fuzz.token_set_ratio(s1_name, c_name) / 100.0
-        name_partial = fuzz.partial_ratio(s1_name, c_name) / 100.0
-    else:
-        name_ratio = name_token_sort = name_token_set = name_partial = 0.0
-        
-    # 5. Compact signature match
-    if s1_comp and c_comp and (s1_comp == c_comp or (len(s1_comp)>=6 and s1_comp in c_comp) or (len(c_comp)>=6 and c_comp in s1_comp)):
-        name_compact_match = 1.0
-    else:
-        name_compact_match = 0.0
-        
-    # 6. Acronym match
-    if (s1_acro and s1_acro == c_comp) or (c_acro and c_acro == s1_comp):
-        name_acronym_match = 1.0
-    else:
-        name_acronym_match = 0.0
-        
-    # 7. is_addr_missing
-    is_addr_missing = 1.0 if (not s1_addr or not c_addr) else 0.0
-    
-    # 8. street_num_match
-    if s1_num and c_num:
-        street_num_match = 1.0 if s1_num == c_num else 0.0
-    elif not s1_num and not c_num:
-        street_num_match = 0.5
-    else:
-        street_num_match = 0.5
-        
-    # 9. street_name_sim
-    if s1_street and c_street:
-        street_name_sim = fuzz.ratio(s1_street, c_street) / 100.0
-    elif not s1_street and not c_street:
-        street_name_sim = 0.5
-    else:
-        street_name_sim = 0.0
-        
-    # 10. city_state_sim
-    if s1_cs and c_cs:
-        city_state_sim = fuzz.token_set_ratio(s1_cs, c_cs) / 100.0
-    elif not s1_cs and not c_cs:
-        city_state_sim = 0.5
-    else:
-        city_state_sim = 0.0
-        
-    # 11. addr_token_sort
-    if s1_addr and c_addr:
-        addr_token_sort = fuzz.token_sort_ratio(s1_addr, c_addr) / 100.0
-    else:
-        addr_token_sort = 0.0
-        
-    # 12. digits_match
-    if s1_d and c_d:
-        digits_match = 1.0 if s1_d == c_d else 0.0
-    elif not s1_d and not c_d:
-        digits_match = 1.0
-    else:
-        digits_match = 0.0
-        
-    # 13. country_match
-    country_match = 1.0 if (s1_country and c_country and s1_country == c_country) else 0.0
-    
-    # 14. is_dba_pattern
-    is_dba_pattern = 1.0 if (street_name_sim >= 0.85 and street_num_match == 1.0 and country_match == 1.0) else 0.0
-    
-    # 15. source_origin
-    source_origin = 1.0 if cand_id.startswith('S2-') else 0.0
-    
-    # 16. candidate_rank (raw integer rank 1..100 as float32)
-    rank_val = float(rank_idx)
-    assert 1.0 <= rank_val <= 100.0, f"Candidate rank {rank_val} out of expected [1, 100] range"
-    
-    res = (name_ratio, name_token_sort, name_token_set, name_partial, name_compact_match, name_acronym_match,
-           is_addr_missing, street_num_match, street_name_sim, city_state_sim, addr_token_sort, digits_match,
-           country_match, is_dba_pattern, source_origin, rank_val)
-    assert len(res) == 16, f"Expected 16 features, got {len(res)}"
-    return res
 
 
 def process_chunk(args):
@@ -282,6 +231,7 @@ def process_chunk(args):
     
     for rec in chunk_records:
         s1_id, cands_str, is_val = rec[:3]
+        row_scores = rec[3] if len(rec) > 3 else None
             
         if not cands_str or cands_str == 'nan':
             continue
@@ -289,24 +239,19 @@ def process_chunk(args):
         raw_cands = [c.strip() for c in cands_str.split(',') if c.strip()]
         
         if is_val:
-            for rank_idx, cid in enumerate(raw_cands[:30], start=1):
-                assert 1 <= rank_idx <= 30, f"Validation candidate rank {rank_idx} is out of expected [1, 30] range"
+            for rank_idx, cid in enumerate(raw_cands, start=1):
+                assert 1 <= rank_idx <= 60, f"Validation candidate rank {rank_idx} is out of expected [1, 60] range"
                 is_match = 1 if cid in true_matches else 0
-                pairs_val.append((s1_id, cid, is_match, rank_idx))
+                dense_score = float(row_scores[rank_idx - 1]) if (row_scores is not None and rank_idx <= len(row_scores)) else 0.0
+                pairs_val.append((s1_id, cid, is_match, rank_idx, dense_score))
                 needed_cand_ids.add(cid)
         else:
-            neg_count = 0
-            max_negs = max(8, len(true_matches) * 6)
             for rank_idx, cid in enumerate(raw_cands, start=1):
-                assert 1 <= rank_idx <= 100, f"Training candidate rank {rank_idx} is out of expected [1, 100] range"
+                assert 1 <= rank_idx <= 60, f"Training candidate rank {rank_idx} is out of expected [1, 60] range"
                 is_match = 1 if cid in true_matches else 0
-                if is_match == 1:
-                    pairs_train.append((s1_id, cid, 1, rank_idx))
-                    needed_cand_ids.add(cid)
-                elif neg_count < max_negs:
-                    pairs_train.append((s1_id, cid, 0, rank_idx))
-                    needed_cand_ids.add(cid)
-                    neg_count += 1
+                dense_score = float(row_scores[rank_idx - 1]) if (row_scores is not None and rank_idx <= len(row_scores)) else 0.0
+                pairs_train.append((s1_id, cid, is_match, rank_idx, dense_score))
+                needed_cand_ids.add(cid)
                     
     if not pairs_train and not pairs_val:
         return "", "", 0, 0, 0, 0
@@ -321,7 +266,7 @@ def process_chunk(args):
         c_acro = get_acronym(name)
         c_addr, s_num, s_name, c_cs, c_pc = decompose_address(addr)
         d_str = extract_digits(f"{n_name} {addr}")
-        catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
+        catalog_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "", str(name) if pd.notna(name) else "", c_pc or "")
     del cat_rows
     
     s1_rows = fetch_by_ids(cur, "s1_catalog", s1_needed, "entity_id, business_name, business_address, country", batch_size=900)
@@ -333,35 +278,37 @@ def process_chunk(args):
         c_acro = get_acronym(name)
         c_addr, s_num, s_name, c_cs, c_pc = decompose_address(addr)
         d_str = extract_digits(f"{n_name} {addr}")
-        s1_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "")
+        s1_dict[eid] = (n_name, c_comp, c_acro, c_addr, s_num, s_name, c_cs, d_str, country or "", str(name) if pd.notna(name) else "", c_pc or "")
     del s1_rows
     
-    empty_rec = ("", "", "", "", "", "", "", "", "")
+    empty_rec = ("", "", "", "", "", "", "", "", "", "", "")
     train_lines = []
     val_lines = []
     train_pos = train_neg = val_pos = val_neg = 0
     
-    for s1_id, cand_id, label, r_idx in pairs_train:
+    for s1_id, cand_id, label, r_idx, dense_s in pairs_train:
         s1_rec = s1_dict.get(s1_id, empty_rec)
         c_rec = catalog_dict.get(cand_id, empty_rec)
-        f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
-        assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
+        f = fast_19_features(s1_rec, c_rec, cand_id, dense_score=dense_s, rank_idx=r_idx)
+        assert len(f) == 19, f"Feature vector length must be 19, got {len(f)}"
         train_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
                            f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
-                           f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{s1_id},{cand_id},{label}\n")
+                           f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{f[16]:.4f},{f[17]:.4f},{f[18]:.1f},"
+                           f"{s1_id},{cand_id},{label}\n")
         if label == 1:
             train_pos += 1
         else:
             train_neg += 1
             
-    for s1_id, cand_id, label, r_idx in pairs_val:
+    for s1_id, cand_id, label, r_idx, dense_s in pairs_val:
         s1_rec = s1_dict.get(s1_id, empty_rec)
         c_rec = catalog_dict.get(cand_id, empty_rec)
-        f = fast_16_features(s1_rec, c_rec, cand_id, rank_idx=r_idx)
-        assert len(f) == 16, f"Feature vector length must be 16, got {len(f)}"
+        f = fast_19_features(s1_rec, c_rec, cand_id, dense_score=dense_s, rank_idx=r_idx)
+        assert len(f) == 19, f"Feature vector length must be 19, got {len(f)}"
         val_lines.append(f"{f[0]:.4f},{f[1]:.4f},{f[2]:.4f},{f[3]:.4f},{f[4]:.1f},{f[5]:.1f},"
                          f"{f[6]:.1f},{f[7]:.1f},{f[8]:.4f},{f[9]:.4f},{f[10]:.4f},{f[11]:.1f},"
-                         f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{s1_id},{cand_id},{label}\n")
+                         f"{f[12]:.1f},{f[13]:.1f},{f[14]:.1f},{f[15]:.1f},{f[16]:.4f},{f[17]:.4f},{f[18]:.1f},"
+                         f"{s1_id},{cand_id},{label}\n")
         if label == 1:
             val_pos += 1
         else:
@@ -413,8 +360,11 @@ def tsv_chunk_generator(tsv_path, chunk_size, val_set, last_s1_id=None, max_chun
             is_val = s1_id in val_set
             if scores_mmap is not None:
                 cands = [c.strip() for c in cands_str.split(',') if c.strip()]
-                row_scores = scores_mmap[row_counter][:len(cands)]
-                assert len(row_scores) == len(cands), f"Dense scores ({len(row_scores)}) != candidates ({len(cands)}) for {s1_id}"
+                n_scores = scores_mmap.shape[1] if len(scores_mmap.shape) > 1 else 0
+                avail = min(len(cands), n_scores)
+                row_scores = list(scores_mmap[row_counter][:avail])
+                if len(cands) > avail:
+                    row_scores.extend([0.0] * (len(cands) - avail))
                 batch.append((s1_id, cands_str, is_val, row_scores))
             else:
                 batch.append((s1_id, cands_str, is_val))
